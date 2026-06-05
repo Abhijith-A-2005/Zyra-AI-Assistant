@@ -1,0 +1,25 @@
+# Build output — large, regenerated on every build
+build/
+
+# Managed components — downloaded automatically
+managed_components/
+
+# Dependencies lock — can be regenerated
+dependencies.lock
+
+# SDK config backup
+sdkconfig.old
+
+# VS Code
+.vscode/
+
+# Clang
+.clangd
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Credentials — NEVER commit these
+# Make sure WiFi password and server IP
+# are not hardcoded before pushing

@@ -1,0 +1,24 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "audio_pipeline.c"
+        "websocket_client.c"
+        "display.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp-sr
+        esp_websocket_client
+        esp_driver_i2s
+        esp_driver_i2c
+        nvs_flash
+        esp_wifi
+        esp_event
+        esp_netif
+        freertos
+        json
+        log
+    PRIV_REQUIRES
+        esp_timer
+)
+target_link_libraries(${COMPONENT_LIB} PRIVATE m)
