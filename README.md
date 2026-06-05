@@ -2,7 +2,9 @@
 
 ZYRA is a local smart home voice assistant built using an **ESP32-S3** and a **Python AI server**.
 
-The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the PC server through WebSocket, gets an AI-generated voice response, and plays it through a MAX98357 I2S amplifier.
+The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the PC server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
+
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, control smart home devices, remember useful context, show system states on an OLED display, and act as a real voice interface for a smart home without depending on cloud assistants.
 
 ---
 
@@ -13,29 +15,100 @@ ZYRA/
 ├── README.md
 ├── .gitignore
 ├── zyra-server/
+│   ├── .env.example
+│   ├── audio_utils.py
+│   ├── config.py
+│   ├── llm.py
+│   ├── main.py
+│   ├── memory.py
+│   ├── requirements.txt
+│   ├── stt.py
+│   ├── test_components.py
+│   ├── test_tts_api.py
+│   ├── test_websocket.py
+│   ├── tts.py
+│   └── models/
+│       └── en_US-lessac-high.onnx.json
+│
 └── zyra-firmware/
+    ├── .gitignore
+    ├── CMakeLists.txt
+    ├── partitions.csv
+    ├── sdkconfig
+    └── main/
+        ├── CMakeLists.txt
+        ├── audio_pipeline.c
+        ├── audio_pipeline.h
+        ├── display.c
+        ├── display.h
+        ├── idf_component.yml
+        ├── main.c
+        ├── websocket_client.c
+        ├── websocket_client.h
+        └── zyra_config.example.h
 ```
 
-### `zyra-server`
+---
 
-Python backend that handles:
+## Folder Overview
+
+### `zyra-server/`
+
+The Python backend brain of ZYRA.
+
+It handles:
 
 * Speech-to-text using Faster-Whisper
 * AI response generation using Ollama
 * Text-to-speech using Piper
 * Memory using ChromaDB and SQLite
-* WebSocket communication with ESP32-S3
+* WebSocket communication with the ESP32-S3
 
-### `zyra-firmware`
+Important files:
 
-ESP32-S3 firmware that handles:
+| File                 | Purpose                                        |
+| -------------------- | ---------------------------------------------- |
+| `main.py`            | Starts the FastAPI WebSocket server            |
+| `config.py`          | Server, model, audio, and memory configuration |
+| `stt.py`             | Speech-to-text engine                          |
+| `llm.py`             | Ollama LLM engine                              |
+| `tts.py`             | Piper text-to-speech engine                    |
+| `memory.py`          | ChromaDB and SQLite memory handling            |
+| `test_components.py` | Tests Ollama, Whisper, Piper, and memory       |
+| `test_websocket.py`  | Tests the WebSocket pipeline                   |
+| `.env.example`       | Example environment configuration              |
+| `requirements.txt`   | Python dependencies                            |
+
+---
+
+### `zyra-firmware/`
+
+The ESP32-S3 firmware.
+
+It handles:
 
 * Wi-Fi connection
-* WebSocket connection to server
+* WebSocket connection to the server
 * INMP441 microphone input
 * MAX98357 speaker output
 * OLED display state
 * Audio capture and playback
+* PSRAM audio buffer allocation
+
+Important files:
+
+| File                         | Purpose                               |
+| ---------------------------- | ------------------------------------- |
+| `main/main.c`                | Main firmware logic                   |
+| `main/audio_pipeline.c`      | I2S mic and speaker pipeline          |
+| `main/audio_pipeline.h`      | Audio pipeline header                 |
+| `main/websocket_client.c`    | ESP32 WebSocket client                |
+| `main/websocket_client.h`    | WebSocket client header               |
+| `main/display.c`             | OLED display handling                 |
+| `main/display.h`             | Display state header                  |
+| `main/zyra_config.example.h` | Safe example Wi-Fi/server config      |
+| `partitions.csv`             | ESP32 flash partition layout          |
+| `sdkconfig`                  | Working ESP-IDF project configuration |
 
 ---
 
@@ -97,6 +170,7 @@ zyra-server/models/en_US-lessac-high.onnx.json
 ```
 
 Only the `.json` config file is committed.
+
 Copy the `.onnx` model manually into:
 
 ```text
@@ -191,7 +265,7 @@ Add your Wi-Fi and server details:
 
 Do not commit `zyra_config.h`.
 
-A safe template file should be committed as:
+A safe template file is included as:
 
 ```text
 zyra-firmware/main/zyra_config.example.h
@@ -313,6 +387,7 @@ Safe to commit:
 zyra-server/.env.example
 zyra-server/models/en_US-lessac-high.onnx.json
 zyra-firmware/main/zyra_config.example.h
+zyra-firmware/sdkconfig
 ```
 
 ---
