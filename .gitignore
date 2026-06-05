@@ -1,0 +1,70 @@
+# Python
+zyra-server/venv/
+zyra-server/.venv/
+zyra-server/__pycache__/
+zyra-server/**/*.pyc
+zyra-server/.env
+
+# Runtime memory / databases
+zyra-server/memory/
+zyra-server/*.db
+zyra-server/**/*.db
+zyra-server/**/*.sqlite3
+
+# Large local model files
+zyra-server/models/*.onnx
+zyra-server/models/*.bin
+zyra-server/models/*.pt
+zyra-server/models/*.gguf
+!zyra-server/models/*.json
+
+# ESP-IDF
+zyra-firmware/build/
+zyra-firmware/managed_components/
+zyra-firmware/dependencies.lock
+zyra-firmware/sdkconfig.old
+
+# Private firmware config
+zyra-firmware/main/zyra_config.h
+
+# Binary build outputs
+*.bin
+*.elf
+*.map
+*.uf2
+
+# Nested Git folders
+**/.git/
+
+# System/editor
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Python cache anywhere
+zyra-server/**/__pycache__/
+zyra-server/.pytest_cache/
+zyra-server/.mypy_cache/
+zyra-server/.ruff_cache/
+
+# Local environment variants
+zyra-server/.env.*
+!zyra-server/.env.example
+
+# Local audio/test outputs
+zyra-server/*.wav
+zyra-server/*.raw
+zyra-server/*.pcm
+
+# Logs
+*.log
+
+# ESP-IDF cache/config extras
+zyra-firmware/.cache/
+zyra-firmware/sdkconfig.defaults.old
+
+# Private local notes
+TODO.local.md
+notes.local.md
