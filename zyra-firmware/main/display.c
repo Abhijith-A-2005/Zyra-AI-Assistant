@@ -19,6 +19,9 @@ static i2c_master_dev_handle_t s_i2c_dev = NULL;
 static uint8_t fb[OLED_WIDTH * OLED_HEIGHT / 8];
 static volatile DisplayState current_state
     = DISP_BOOTING;
+void display_set_state(DisplayState state) {
+    current_state = state;
+}
 
 // ── I2C write ─────────────────────────────────────
 static void oled_write(uint8_t* data, size_t len) {
@@ -215,7 +218,7 @@ void display_update(DisplayState state) {
             break;
 
         case DISP_IDLE:
-            fb_text(22, 2, "SAY JARVIS");
+            fb_text(22, 2, "LISTENING");
             fb_hline(0, 14, 128);
             {
                 uint32_t t = xTaskGetTickCount()

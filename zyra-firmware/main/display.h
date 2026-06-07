@@ -13,5 +13,6 @@ typedef enum {
 } DisplayState;
 
 esp_err_t display_init(void);
+void display_set_state(DisplayState state);
 void display_update(DisplayState state);
 void display_task(void* param);

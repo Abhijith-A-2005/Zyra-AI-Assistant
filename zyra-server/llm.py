@@ -44,11 +44,11 @@ class LLMEngine:
                 "stream":     False,
                 "keep_alive": -1,
                 "options": {
-                    "temperature": 0.7,
-                    "top_p":       0.9,
-                    "num_predict": 60,
-                    "num_gpu":     99,
-                    "num_thread":  4,
+                    "temperature": 0.6, # 0.0 = deterministic, 1.0 = creative
+                    "top_p":       0.85, # 0.0-1.0, lower = more focused on high-prob tokens
+                    "num_predict": 50,   # max tokens to generate (roughly 1 token = 0.75 words)
+                    "num_gpu":     99,  # use all available GPU memory for faster generation
+                    "num_thread":  6,  # use multiple CPU threads to speed up generation (if GPU is not maxed out)  
                 }
             }
 

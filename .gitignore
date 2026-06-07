@@ -68,3 +68,10 @@ zyra-firmware/sdkconfig.defaults.old
 # Private local notes
 TODO.local.md
 notes.local.md
+
+# Smart-home local config / secrets
+zyra-server/smart_home.local.json
+zyra-server/smart_home.local.yaml
+zyra-server/smart_home.local.yml
+zyra-server/*secret*
+zyra-server/*secrets*

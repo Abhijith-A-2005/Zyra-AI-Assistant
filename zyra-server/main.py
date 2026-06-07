@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -10,6 +11,7 @@ from stt import STTEngine
 from llm import LLMEngine
 from tts import TTSEngine
 from memory import MemoryEngine
+from smart_home import SmartHomeEngine
 
 import sys
 import os
@@ -34,6 +36,7 @@ stt    = STTEngine()
 llm    = LLMEngine()
 tts    = TTSEngine()
 memory = MemoryEngine()
+smart_home = SmartHomeEngine()
 logger.info("All engines ready")
 
 # ── FastAPI app ───────────────────────────────────
@@ -50,6 +53,87 @@ connections: dict = {}
 
 
 # ── Shared pipeline helper ────────────────────────
+async def send_direct_voice_response(websocket: WebSocket,
+                                     response_text: str):
+    """
+    TTS → send audio directly.
+    Used for smart-home commands that skip the LLM.
+    """
+    loop = asyncio.get_running_loop()
+
+    await websocket.send_json({
+        "status":   "processing",
+        "stage":    "speaking",
+        "response": response_text
+    })
+
+    try:
+        tts_start = time.perf_counter()
+
+        audio_response = await asyncio.wait_for(
+            loop.run_in_executor(None, tts.synthesize, response_text),
+            timeout=30.0
+        )
+
+        tts_ms = (time.perf_counter() - tts_start) * 1000
+        logger.info(f"Timing: direct_tts={tts_ms:.0f}ms")
+
+    except asyncio.TimeoutError:
+        logger.error("Direct command TTS timed out")
+        await websocket.send_json({
+            "status":  "error",
+            "message": "TTS timeout"
+        })
+        return
+
+    if audio_response:
+        await websocket.send_json({
+            "status":      "audio_incoming",
+            "audio_bytes": len(audio_response),
+            "sample_rate": tts.sample_rate
+        })
+        await websocket.send_bytes(audio_response)
+
+        logger.info(
+            f"Direct command audio sent — {len(audio_response)} bytes"
+        )
+    else:
+        await websocket.send_json({
+            "status":  "error",
+            "message": "TTS produced no audio"
+        })
+
+async def try_smart_home_command(websocket: WebSocket,
+                                 transcript: str) -> bool:
+    """
+    Returns True if the transcript was handled as a smart-home command.
+    Returns False if it should continue to normal LLM pipeline.
+    """
+    cmd_start = time.perf_counter()
+
+    result = smart_home.handle(transcript)
+
+    cmd_ms = (time.perf_counter() - cmd_start) * 1000
+
+    if not result.handled:
+        return False
+
+    logger.info(
+        f"Direct smart-home command handled in {cmd_ms:.0f}ms | "
+        f"action={result.action} devices={result.devices} "
+        f"response='{result.response}'"
+    )
+
+    await websocket.send_json({
+        "status":     "processing",
+        "stage":      "command",
+        "transcript": transcript,
+        "response":   result.response
+    })
+
+    await send_direct_voice_response(websocket, result.response)
+    return True
+
 async def run_pipeline(websocket: WebSocket,
                        client_id: int,
                        transcript: str):
@@ -60,9 +144,16 @@ async def run_pipeline(websocket: WebSocket,
     caller can handle it cleanly.
     """
     loop = asyncio.get_running_loop()
+    pipeline_start = time.perf_counter()
 
     # Recall relevant memories
+    mem_start = time.perf_counter()
+
     memories = memory.recall_memory(transcript)
+
+    mem_ms = (time.perf_counter() - mem_start) * 1000
+    logger.info(f"Timing: memory={mem_ms:.0f}ms")
+
     if memories:
         connections[client_id].append({
             "role":    "system",
@@ -72,10 +163,16 @@ async def run_pipeline(websocket: WebSocket,
     # ── LLM ───────────────────────────────────────
     history = connections[client_id]
     try:
+        llm_start = time.perf_counter()
+
         response = await asyncio.wait_for(
             loop.run_in_executor(None, llm.chat, transcript, history),
             timeout=60.0
         )
+
+        llm_ms = (time.perf_counter() - llm_start) * 1000
+        logger.info(f"Timing: llm={llm_ms:.0f}ms")
+
     except asyncio.TimeoutError:
         logger.error("LLM timed out")
         await websocket.send_json({
@@ -103,10 +200,16 @@ async def run_pipeline(websocket: WebSocket,
 
     # ── TTS ───────────────────────────────────────
     try:
+        tts_start = time.perf_counter()
+
         audio_response = await asyncio.wait_for(
             loop.run_in_executor(None, tts.synthesize, response),
             timeout=30.0
         )
+
+        tts_ms = (time.perf_counter() - tts_start) * 1000
+        logger.info(f"Timing: tts={tts_ms:.0f}ms")
+        
     except asyncio.TimeoutError:
         logger.error("TTS timed out")
         await websocket.send_json({
@@ -122,7 +225,12 @@ async def run_pipeline(websocket: WebSocket,
             "sample_rate": tts.sample_rate
         })
         await websocket.send_bytes(audio_response)
-        logger.info(f"Audio sent — {len(audio_response)} bytes")
+
+        total_ms = (time.perf_counter() - pipeline_start) * 1000
+        logger.info(
+            f"Audio sent — {len(audio_response)} bytes | "
+            f"Timing: pipeline_total={total_ms:.0f}ms"
+        )
     else:
         await websocket.send_json({
             "status":  "error",
@@ -154,11 +262,17 @@ async def zyra_websocket(websocket: WebSocket):
                 # STT
                 loop = asyncio.get_running_loop()
                 try:
+                    stt_start = time.perf_counter()
+
                     transcript = await asyncio.wait_for(
                         loop.run_in_executor(
                             None, stt.transcribe, audio_bytes),
                         timeout=30.0
                     )
+
+                    stt_ms = (time.perf_counter() - stt_start) * 1000
+                    logger.info(f"Timing: stt={stt_ms:.0f}ms")
+                    
                 except asyncio.TimeoutError:
                     logger.error("STT timed out")
                     await websocket.send_json({
@@ -177,6 +291,12 @@ async def zyra_websocket(websocket: WebSocket):
                     continue
 
                 logger.info(f"Transcript: '{transcript}'")
+
+                # ── Fast smart-home command path ──────────────────
+                # Commands like "turn on TV" skip memory + LLM.
+                if await try_smart_home_command(websocket, transcript):
+                    continue
+                # ── Normal LLM pipeline ───────────────────────────
                 await websocket.send_json({
                     "status":     "processing",
                     "stage":      "thinking",
@@ -199,6 +319,11 @@ async def zyra_websocket(websocket: WebSocket):
                         continue
 
                     logger.info(f"Text inject: '{transcript}'")
+
+                    # ── Fast smart-home command path for PC testing ───
+                    if await try_smart_home_command(websocket, transcript):
+                        continue
+
                     await websocket.send_json({
                         "status":     "processing",
                         "stage":      "thinking",
@@ -266,7 +391,11 @@ async def health():
     return {
         "status": "online",
         "model":  llm.model,
-        "memory": "connected"
+        "memory": "connected",
+        "smart_home": {
+            "configured_urls": smart_home.base_urls,
+            "active_url": smart_home.active_base_url,
+        }
     }
 
 

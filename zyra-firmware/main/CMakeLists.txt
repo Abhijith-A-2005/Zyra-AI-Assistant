@@ -7,7 +7,7 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
-        esp-sr
+        #esp-sr
         esp_websocket_client
         esp_driver_i2s
         esp_driver_i2c
