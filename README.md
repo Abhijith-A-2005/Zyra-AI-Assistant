@@ -4,9 +4,10 @@ ZYRA is a local smart home voice assistant built using an **ESP32-S3** and a **P
 
 The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the PC server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
 
-The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, control smart home devices, remember useful context, show system states on an OLED display, and act as a real voice interface for a smart home without depending on cloud assistants.
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, control smart home devices, remember useful context, show system states on an OLED display, and act as a real voice interface for a smart home such as turning devices on or off without depending on cloud assistants.
 
----
+The actual relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain and ESP32-S3 voice interface.
+
 
 ## Project Structure
 
@@ -22,8 +23,10 @@ ZYRA/
 │   ├── main.py
 │   ├── memory.py
 │   ├── requirements.txt
+│   ├── smart_home.py
 │   ├── stt.py
 │   ├── test_components.py
+│   ├── test_smart_home.py
 │   ├── test_tts_api.py
 │   ├── test_websocket.py
 │   ├── tts.py
@@ -62,22 +65,26 @@ It handles:
 * AI response generation using Ollama
 * Text-to-speech using Piper
 * Memory using ChromaDB and SQLite
+* Smart-home command recognition
+* Local relay-board HTTP control
 * WebSocket communication with the ESP32-S3
 
 Important files:
 
-| File                 | Purpose                                        |
-| -------------------- | ---------------------------------------------- |
-| `main.py`            | Starts the FastAPI WebSocket server            |
-| `config.py`          | Server, model, audio, and memory configuration |
-| `stt.py`             | Speech-to-text engine                          |
-| `llm.py`             | Ollama LLM engine                              |
-| `tts.py`             | Piper text-to-speech engine                    |
-| `memory.py`          | ChromaDB and SQLite memory handling            |
-| `test_components.py` | Tests Ollama, Whisper, Piper, and memory       |
-| `test_websocket.py`  | Tests the WebSocket pipeline                   |
-| `.env.example`       | Example environment configuration              |
-| `requirements.txt`   | Python dependencies                            |
+| File                 | Purpose                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| `main.py`            | Starts the FastAPI WebSocket server                        |
+| `config.py`          | Server, model, audio, memory, and smart-home configuration |
+| `stt.py`             | Speech-to-text engine                                      |
+| `llm.py`             | Ollama LLM engine                                          |
+| `tts.py`             | Piper text-to-speech engine                                |
+| `memory.py`          | ChromaDB and SQLite memory handling                        |
+| `smart_home.py`      | Smart-home command handling and relay-board HTTP control   |
+| `test_components.py` | Tests Ollama, Whisper, Piper, and memory                   |
+| `test_smart_home.py` | Tests smart-home command handling                          |
+| `test_websocket.py`  | Tests the WebSocket pipeline                               |
+| `.env.example`       | Example environment configuration                          |
+| `requirements.txt`   | Python dependencies                                        |
 
 ---
 
@@ -88,10 +95,10 @@ The ESP32-S3 firmware.
 It handles:
 
 * Wi-Fi connection
-* WebSocket connection to the server
+* WebSocket connection to the ZYRA server
 * INMP441 microphone input
 * MAX98357 speaker output
-* OLED display state
+* OLED display states
 * Audio capture and playback
 * PSRAM audio buffer allocation
 
@@ -100,7 +107,7 @@ Important files:
 | File                         | Purpose                               |
 | ---------------------------- | ------------------------------------- |
 | `main/main.c`                | Main firmware logic                   |
-| `main/audio_pipeline.c`      | I2S mic and speaker pipeline          |
+| `main/audio_pipeline.c`      | I2S microphone and speaker pipeline   |
 | `main/audio_pipeline.h`      | Audio pipeline header                 |
 | `main/websocket_client.c`    | ESP32 WebSocket client                |
 | `main/websocket_client.h`    | WebSocket client header               |
@@ -112,6 +119,44 @@ Important files:
 
 ---
 
+## Smart Home Integration
+
+ZYRA can understand smart-home commands and directly control configured devices through the local network.
+
+Supported device categories can include:
+
+* TV
+* Soundbar
+* Subwoofer
+* Rear speakers
+* Full home-theater system
+
+Example commands:
+
+```text
+Turn on my TV
+Switch off the soundbar
+Turn on the rear speakers
+Power off the home theatre
+Turn everything off
+```
+
+The relay board itself is handled by a separate Smart-Switch-Board project. This ZYRA repository only contains the assistant-side command intelligence and communication logic.
+
+Typical flow:
+
+```text
+User voice
+→ ESP32-S3 microphone
+→ ZYRA server
+→ Speech-to-text
+→ Smart-home command detection
+→ Local HTTP request to relay board
+→ Voice confirmation from ZYRA
+```
+
+---
+
 ## Hardware Used
 
 * ESP32-S3 N16R8
@@ -119,7 +164,8 @@ Important files:
 * MAX98357A I2S amplifier
 * 0.96 inch SSD1306 OLED display
 * Speaker
-* PC or laptop for running the AI server
+* PC or laptop for running the ZYRA server
+* Separate ESP8266 Smart Extension relay board
 
 ---
 
@@ -179,6 +225,43 @@ zyra-server/models/
 
 ---
 
+## Environment Setup
+
+Copy:
+
+```text
+zyra-server/.env.example
+```
+
+to:
+
+```text
+zyra-server/.env
+```
+
+Example:
+
+```env
+PYTHONIOENCODING=utf-8
+
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b-instruct-q4_0
+
+HOST=0.0.0.0
+PORT=8765
+
+WHISPER_MODEL=small.en
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE=float16
+
+SMART_HOME_BASE_URL=http://192.168.29.97
+SMART_HOME_TIMEOUT=2.0
+```
+
+Use the IP address of your Smart Extension relay board for `SMART_HOME_BASE_URL`.
+
+---
+
 ## Run the Server
 
 Start Ollama first:
@@ -228,6 +311,18 @@ Expected:
 ✓ Piper TTS working
 ✓ Memory working
 ✓✓✓ All components working
+```
+
+Test smart-home command handling:
+
+```powershell
+python test_smart_home.py
+```
+
+Test WebSocket pipeline:
+
+```powershell
+python test_websocket.py --text "Turn on my TV"
 ```
 
 ---
@@ -390,6 +485,8 @@ zyra-firmware/main/zyra_config.example.h
 zyra-firmware/sdkconfig
 ```
 
+The Smart Extension relay firmware should be committed in its own separate repository.
+
 ---
 
 ## Troubleshooting
@@ -402,6 +499,16 @@ Check:
 * ESP32 and laptop are on the same Wi-Fi
 * `SERVER_IP` is the laptop IPv4 address
 * Firewall allows port `8765`
+
+### Smart-home command is understood but device does not respond
+
+Check:
+
+* Smart Extension relay board is powered
+* Relay board and ZYRA server are on the same network
+* `SMART_HOME_BASE_URL` points to the relay board IP
+* Relay board HTTP endpoints are working
+* Browser can open the relay board status page
 
 ### Piper model not found
 
@@ -447,10 +554,13 @@ Completed:
 * I2S mic initialization
 * I2S amplifier initialization
 * PSRAM audio buffer allocation
+* Smart-home command recognition
+* Local relay-board command forwarding
 
 Next:
 
-* End-to-end voice testing
+* End-to-end smart-home voice testing
 * OLED display stabilization
-* Smart home relay command integration
+* Offline fallback command handling
 * Wake word refinement
+* Separate Smart Extension repository cleanup
