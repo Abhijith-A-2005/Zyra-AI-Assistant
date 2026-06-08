@@ -2,12 +2,14 @@
 
 ZYRA is a local smart home voice assistant built using an **ESP32-S3** and a **Python AI server**.
 
-The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the PC server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
+The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
 
-The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, control smart home devices, remember useful context, show system states on an OLED display, and act as a real voice interface for a smart home such as turning devices on or off without depending on cloud assistants.
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, and intelligently understand smart-home commands such as turning devices on, turning devices off, and controlling grouped home-theater devices without depending on cloud assistants.
 
-The actual relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain and ESP32-S3 voice interface.
+The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, and ESP32-S3 voice interface.
 
+
+---
 
 ## Project Structure
 
@@ -15,10 +17,12 @@ The actual relay board firmware is maintained in a separate Smart-Switch-Board r
 ZYRA/
 ├── README.md
 ├── .gitignore
+│
 ├── zyra-server/
 │   ├── .env.example
 │   ├── audio_utils.py
 │   ├── config.py
+│   ├── intent_router.py
 │   ├── llm.py
 │   ├── main.py
 │   ├── memory.py
@@ -65,26 +69,28 @@ It handles:
 * AI response generation using Ollama
 * Text-to-speech using Piper
 * Memory using ChromaDB and SQLite
-* Smart-home command recognition
-* Local relay-board HTTP control
+* Intent routing for assistant and smart-home commands
+* Smart-home command understanding
+* Local relay-board HTTP command forwarding
 * WebSocket communication with the ESP32-S3
 
 Important files:
 
-| File                 | Purpose                                                    |
-| -------------------- | ---------------------------------------------------------- |
-| `main.py`            | Starts the FastAPI WebSocket server                        |
-| `config.py`          | Server, model, audio, memory, and smart-home configuration |
-| `stt.py`             | Speech-to-text engine                                      |
-| `llm.py`             | Ollama LLM engine                                          |
-| `tts.py`             | Piper text-to-speech engine                                |
-| `memory.py`          | ChromaDB and SQLite memory handling                        |
-| `smart_home.py`      | Smart-home command handling and relay-board HTTP control   |
-| `test_components.py` | Tests Ollama, Whisper, Piper, and memory                   |
-| `test_smart_home.py` | Tests smart-home command handling                          |
-| `test_websocket.py`  | Tests the WebSocket pipeline                               |
-| `.env.example`       | Example environment configuration                          |
-| `requirements.txt`   | Python dependencies                                        |
+| File                 | Purpose                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| `main.py`            | Starts the FastAPI WebSocket server                                  |
+| `config.py`          | Server, model, audio, memory, and smart-home configuration           |
+| `intent_router.py`   | Routes transcripts into assistant chat or smart-home control intents |
+| `smart_home.py`      | Executes smart-home commands and forwards relay-board HTTP control   |
+| `stt.py`             | Speech-to-text engine                                                |
+| `llm.py`             | Ollama LLM engine                                                    |
+| `tts.py`             | Piper text-to-speech engine                                          |
+| `memory.py`          | ChromaDB and SQLite memory handling                                  |
+| `test_components.py` | Tests Ollama, Whisper, Piper, and memory                             |
+| `test_smart_home.py` | Tests smart-home command handling                                    |
+| `test_websocket.py`  | Tests the WebSocket pipeline                                         |
+| `.env.example`       | Example environment configuration                                    |
+| `requirements.txt`   | Python dependencies                                                  |
 
 ---
 
@@ -106,7 +112,7 @@ Important files:
 
 | File                         | Purpose                               |
 | ---------------------------- | ------------------------------------- |
-| `main/main.c`                | Main firmware logic                   |
+| `main/main.c`                | Main ESP32-S3 firmware logic          |
 | `main/audio_pipeline.c`      | I2S microphone and speaker pipeline   |
 | `main/audio_pipeline.h`      | Audio pipeline header                 |
 | `main/websocket_client.c`    | ESP32 WebSocket client                |
@@ -119,17 +125,17 @@ Important files:
 
 ---
 
-## Smart Home Integration
+## Smart Home Intelligence
 
-ZYRA can understand smart-home commands and directly control configured devices through the local network.
+ZYRA can identify smart-home commands from natural speech and route them to the correct device action.
 
-Supported device categories can include:
+Supported smart-home capabilities include:
 
-* TV
-* Soundbar
-* Subwoofer
-* Rear speakers
-* Full home-theater system
+* Turning individual devices on or off
+* Understanding device aliases
+* Handling grouped commands
+* Controlling home-theater devices through a local relay board
+* Giving voice confirmation after the command is handled
 
 Example commands:
 
@@ -137,11 +143,10 @@ Example commands:
 Turn on my TV
 Switch off the soundbar
 Turn on the rear speakers
-Power off the home theatre
+Turn off the sound system
 Turn everything off
+Power on the home theatre
 ```
-
-The relay board itself is handled by a separate Smart-Switch-Board project. This ZYRA repository only contains the assistant-side command intelligence and communication logic.
 
 Typical flow:
 
@@ -150,10 +155,13 @@ User voice
 → ESP32-S3 microphone
 → ZYRA server
 → Speech-to-text
-→ Smart-home command detection
+→ Intent router
+→ Smart-home command handler
 → Local HTTP request to relay board
 → Voice confirmation from ZYRA
 ```
+
+The relay-board firmware is not stored in this repository. It belongs in the separate Smart-Switch-Board repository.
 
 ---
 
@@ -177,7 +185,7 @@ Go to the server folder:
 cd C:\Users\abhia\Documents\ZYRA\zyra-server
 ```
 
-Create virtual environment:
+Create a virtual environment:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -189,13 +197,19 @@ Activate it:
 .\.venv\Scripts\Activate.ps1
 ```
 
+Upgrade pip tools:
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
+```
+
 Install PyTorch CUDA:
 
 ```powershell
 python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Install dependencies:
+Install project dependencies:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -260,6 +274,8 @@ SMART_HOME_TIMEOUT=2.0
 
 Use the IP address of your Smart Extension relay board for `SMART_HOME_BASE_URL`.
 
+Do not commit `.env`.
+
 ---
 
 ## Run the Server
@@ -270,7 +286,7 @@ Start Ollama first:
 ollama run llama3.2:3b-instruct-q4_0
 ```
 
-Then run the server:
+Then run the ZYRA server:
 
 ```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-server
@@ -299,6 +315,8 @@ http://localhost:8765/health
 
 ## Test Server Components
 
+Run the main component test:
+
 ```powershell
 python test_components.py
 ```
@@ -319,7 +337,7 @@ Test smart-home command handling:
 python test_smart_home.py
 ```
 
-Test WebSocket pipeline:
+Test the WebSocket pipeline:
 
 ```powershell
 python test_websocket.py --text "Turn on my TV"
@@ -329,7 +347,7 @@ python test_websocket.py --text "Turn on my TV"
 
 ## Firmware Setup
 
-Go to firmware folder:
+Go to the firmware folder:
 
 ```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-firmware
@@ -485,7 +503,7 @@ zyra-firmware/main/zyra_config.example.h
 zyra-firmware/sdkconfig
 ```
 
-The Smart Extension relay firmware should be committed in its own separate repository.
+The Smart Extension relay-board firmware should be committed in its own separate repository.
 
 ---
 
@@ -554,8 +572,15 @@ Completed:
 * I2S mic initialization
 * I2S amplifier initialization
 * PSRAM audio buffer allocation
-* Smart-home command recognition
+* Intent routing
+* Smart-home command understanding
 * Local relay-board command forwarding
+
+Not included yet:
+
+* Offline mode
+* Wake word refinement
+* Smart Extension relay-board firmware
 
 Next:
 
