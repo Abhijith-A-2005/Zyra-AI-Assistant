@@ -12,6 +12,7 @@ from llm import LLMEngine
 from tts import TTSEngine
 from memory import MemoryEngine
 from smart_home import SmartHomeEngine
+from intent_router import IntentRouter
 
 import sys
 import os
@@ -37,6 +38,7 @@ llm    = LLMEngine()
 tts    = TTSEngine()
 memory = MemoryEngine()
 smart_home = SmartHomeEngine()
+intent_router = IntentRouter()
 logger.info("All engines ready")
 
 # ── FastAPI app ───────────────────────────────────
@@ -106,22 +108,42 @@ async def send_direct_voice_response(websocket: WebSocket,
 async def try_smart_home_command(websocket: WebSocket,
                                  transcript: str) -> bool:
     """
-    Returns True if the transcript was handled as a smart-home command.
-    Returns False if it should continue to normal LLM pipeline.
+    Returns True if the transcript was handled as a smart-home request.
+    Returns False if it should continue to normal LLM conversation.
     """
-    cmd_start = time.perf_counter()
+    route_start = time.perf_counter()
 
-    result = smart_home.handle(transcript)
+    routed = intent_router.route(transcript)
 
-    cmd_ms = (time.perf_counter() - cmd_start) * 1000
+    route_ms = (time.perf_counter() - route_start) * 1000
+
+    command_summary = [
+        {
+            "action": cmd.action,
+            "devices": cmd.devices,
+        }
+        for cmd in routed.commands
+    ]
+
+    logger.info(
+        f"Intent routing took {route_ms:.0f}ms | "
+        f"domain={routed.domain} intent={routed.intent} "
+        f"action={routed.action} devices={routed.devices} "
+        f"commands={command_summary} "
+        f"confidence={routed.confidence:.2f}"
+    )
+
+    if routed.domain != "smart_home":
+        return False
+
+    result = smart_home.handle_intent(routed)
 
     if not result.handled:
         return False
 
     logger.info(
-        f"Direct smart-home command handled in {cmd_ms:.0f}ms | "
-        f"action={result.action} devices={result.devices} "
-        f"response='{result.response}'"
+        f"Direct smart-home result | action={result.action} "
+        f"devices={result.devices} response='{result.response}'"
     )
 
     await websocket.send_json({

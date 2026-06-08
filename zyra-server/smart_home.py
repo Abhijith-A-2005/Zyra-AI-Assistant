@@ -1,11 +1,11 @@
 import logging
-import re
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
 
 from config import SMART_HOME_BASE_URLS, SMART_HOME_TIMEOUT_SEC
+from intent_router import RoutedIntent, RoutedCommand
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +20,10 @@ class SmartHomeResult:
 
 class SmartHomeEngine:
     """
-    Direct smart-home command engine for ZYRA.
+    Executes validated smart-home intents.
 
-    This runs after STT and before LLM.
-    If a transcript is a relay command, it handles the command directly.
-    If not, main.py sends the transcript to the normal LLM pipeline.
+    This class does not understand natural language.
+    It only receives structured intents and talks to the ESP8266 relay board.
     """
 
     def __init__(self):
@@ -36,92 +35,31 @@ class SmartHomeEngine:
         self.devices = {
             "tv": {
                 "label": "TV",
-                "names": [
-                    "tv",
-                    "television",
-                    "sony tv",
-                    "sony television",
-                ],
+                "plural": False,
                 "on": "/sony/on",
                 "off": "/sony/off",
                 "toggle": "/sony/toggle",
             },
             "soundbar": {
                 "label": "Soundbar",
-                "names": [
-                    "soundbar",
-                    "sound bar",
-                    "speaker bar",
-                    "bar",
-                ],
+                "plural": False,
                 "on": "/sb/on",
                 "off": "/sb/off",
                 "toggle": "/sb/toggle",
             },
             "subwoofer": {
                 "label": "Subwoofer",
-                "names": [
-                    "subwoofer",
-                    "sub woofer",
-                    "woofer",
-                    "sub",
-                ],
+                "plural": False,
                 "on": "/sub/on",
                 "off": "/sub/off",
                 "toggle": "/sub/toggle",
             },
             "rear": {
                 "label": "Rear speakers",
-                "names": [
-                    "rear",
-                    "back",
-                    "rear speaker",
-                    "rear speakers",
-                    "surround",
-                    "surround speaker",
-                    "surround speakers",
-                    "surround system",
-                    "back speaker",
-                    "back speakers",
-                ],
+                "plural": True,
                 "on": "/rear/on",
                 "off": "/rear/off",
                 "toggle": "/rear/toggle",
-            },
-        }
-
-        self.groups = {
-            "sound_system": {
-                "label": "Sound system",
-                "names": [
-                    "sound system",
-                    "audio system",
-                    "speaker system",
-                ],
-                "devices": ["soundbar", "subwoofer","rear"],
-            },
-            "all_speakers": {
-                "label": "All speakers",
-                "names": [
-                    "all speakers",
-                    "speakers",
-                    "surround system",
-                ],
-                "devices": ["soundbar", "subwoofer", "rear"],
-            },
-            "home_theater": {
-                "label": "Home theater",
-                "names": [
-                    "home theater",
-                    "home theatre",
-                    "theater",
-                    "theatre",
-                    "full system",
-                    "entire system",
-                    "everything",
-                    "all devices",
-                ],
-                "devices": ["tv", "soundbar", "subwoofer", "rear"],
             },
         }
 
@@ -130,189 +68,55 @@ class SmartHomeEngine:
             + ", ".join(self.base_urls)
         )
 
-    def handle(self, transcript: str) -> SmartHomeResult:
+    def handle_intent(self, routed: RoutedIntent) -> SmartHomeResult:
         """
-        Main entry point.
+        Executes a routed smart-home intent.
 
-        Returns handled=False if this is not a smart-home command.
-        Returns handled=True with a response if smart_home.py handled it.
+        Safety rule:
+        Low-confidence control commands are not executed.
         """
-        text = self._normalize(transcript)
-
-        if not text:
+        if routed.domain != "smart_home":
             return SmartHomeResult(False, "")
 
-        # Status questions must be checked before action detection.
-        # Example: "Is the TV on?" contains "on", but it is a question,
-        # not a command to turn the TV on.
-        if self._is_status_question(text):
-            return self._handle_status_question(text)
+        if routed.confidence < 0.65:
+            return SmartHomeResult(
+                True,
+                "I heard a device command, but I could not parse it safely.",
+                action="clarify",
+                devices=routed.devices,
+            )
 
-        action = self._detect_action(text)
-        if not action:
-            return SmartHomeResult(False, "")
+        if routed.intent == "status":
+            return self._handle_status(routed.devices)
 
-        devices = self._detect_devices(text)
-        if not devices:
-            return SmartHomeResult(False, "")
+        if routed.intent == "control":
+            if routed.confidence < 0.75:
+                return SmartHomeResult(
+                    True,
+                    "I heard a device command, but I am not confident enough to execute it.",
+                    action="clarify",
+                    devices=routed.devices,
+                )
 
-        return self._execute_action(action, devices)
+            return self._execute_command_batch(routed.commands)
 
-    def _normalize(self, text: str) -> str:
-        text = text.lower().strip()
+        return SmartHomeResult(False, "")
 
-        replacements = {
-            "what's": "what is",
-            "whats": "what is",
-            "who's": "who is",
-            "isn't": "is not",
-            "aren't": "are not",
-        }
+    def _expand_devices(self, devices: list[str]) -> list[str]:
+        if not devices or "all" in devices:
+            return ["tv", "soundbar", "subwoofer", "rear"]
 
-        for old, new in replacements.items():
-            text = text.replace(old, new)
+        expanded = []
 
-        text = re.sub(r"[^a-z0-9\s]", " ", text)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        for device in devices:
+            if device in self.devices and device not in expanded:
+                expanded.append(device)
 
-    def _detect_action(self, text: str) -> Optional[str]:
-        off_phrases = [
-            "turn off",
-            "switch off",
-            "power off",
-            "shut down",
-            "shutdown",
-            "disable",
-            "deactivate",
-            "stop",
-            "put off",
-        ]
+        return expanded
 
-        on_phrases = [
-            "turn on",
-            "switch on",
-            "power on",
-            "enable",
-            "activate",
-            "start",
-            "put on",
-        ]
-
-        toggle_phrases = [
-            "toggle",
-            "flip",
-        ]
-
-        # OFF first, because phrases like "turn off" contain command words
-        # that should not be confused with generic switching.
-        for phrase in off_phrases:
-            if phrase in text:
-                return "off"
-
-        for phrase in on_phrases:
-            if phrase in text:
-                return "on"
-
-        for phrase in toggle_phrases:
-            if phrase in text:
-                return "toggle"
-
-        # Short command support:
-        # "TV on", "soundbar off", "subwoofer on".
-        words = text.split()
-
-        if "off" in words:
-            return "off"
-
-        if "on" in words:
-            return "on"
-
-        return None
-
-    def _detect_devices(self, text: str) -> list[str]:
-        matched: list[str] = []
-
-        # Group detection first.
-        # Example: "turn on all speakers" should not only match "rear speakers".
-        for group_cfg in self.groups.values():
-            for name in group_cfg["names"]:
-                if self._contains_phrase(text, name):
-                    for device_id in group_cfg["devices"]:
-                        if device_id not in matched:
-                            matched.append(device_id)
-                    return matched
-
-        # Individual devices.
-        for device_id, cfg in self.devices.items():
-            for name in cfg["names"]:
-                if self._contains_phrase(text, name):
-                    matched.append(device_id)
-                    break
-
-        return matched
-
-    def _contains_phrase(self, text: str, phrase: str) -> bool:
-        return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
-
-    def _is_status_question(self, text: str) -> bool:
-        status_phrases = [
-            "status",
-            "device status",
-            "what is the device status",
-            "what is the status",
-            "relay status",
-            "home theater status",
-            "home theatre status",
-            "what is the home theater status",
-            "system status",
-            "what is the system status",
-            "what is on",
-            "what all is on",
-            "which devices are on",
-            "which device is on",
-            "what devices are on",
-            "what all devices are on",
-            "What all devices are currently on",
-            "what is currently on",
-            "what all is currently on",
-            "what devices are currently on",
-            "which devices are currently on",
-            "what all are off",
-            "what is off",
-            "what devices are off",
-            "which devices are off",
-            "what all devices are off",
-            "which all devices are off",
-            "what is the status",
-            "what device is on",
-            "what is turned on",
-            "what is switched on",
-            "check devices",
-            "check device",
-            "check home theater",
-            "check home theatre",
-        ]
-
-        if any(phrase in text for phrase in status_phrases):
-            return True
-        # Device-specific questions:
-        # "Is TV on?", "Are rear speakers off?"
-        starts_like_question = (
-            text.startswith("is ")
-            or text.startswith("are ")
-            or text.startswith("check ")
-        )
-
-        if starts_like_question and self._detect_devices(text):
-            return True
-
-        return False
-
-    def _handle_status_question(self, text: str) -> SmartHomeResult:
-        devices = self._detect_devices(text)
-
+    def _handle_status(self, devices: list[str]) -> SmartHomeResult:
         status = self.get_status()
+
         if status is None:
             return SmartHomeResult(
                 True,
@@ -321,69 +125,81 @@ class SmartHomeEngine:
                 devices=devices,
             )
 
-        if devices:
-            response = self._format_specific_status(status, devices)
-        else:
+        expanded = self._expand_devices(devices)
+
+        if not devices or "all" in devices:
             response = self._format_full_status(status)
+        else:
+            response = self._format_specific_status(status, expanded)
 
         return SmartHomeResult(
             True,
             response,
             action="status",
-            devices=devices,
+            devices=expanded,
         )
 
-    def _execute_action(self, action: str, devices: list[str]) -> SmartHomeResult:
-        successful: list[str] = []
-        failed: list[str] = []
+    def _execute_command_batch(
+        self,
+        commands: list[RoutedCommand],
+    ) -> SmartHomeResult:
+        if not commands:
+            return SmartHomeResult(
+                True,
+                "I understood a command, but not the device action.",
+                action="clarify",
+                devices=[],
+            )
 
-        for device_id in devices:
-            endpoint = self.devices[device_id][action]
+        executed_groups = []
+        failed_devices = []
 
-            if self._get(endpoint) is not None:
-                successful.append(device_id)
-            else:
-                failed.append(device_id)
+        for command in commands:
+            action = command.action
+            devices = self._expand_devices(command.devices)
 
-        if not successful and failed:
+            for device_id in devices:
+                endpoint = self.devices[device_id][action]
+
+                if self._get(endpoint) is not None:
+                    executed_groups.append((action, device_id))
+                else:
+                    failed_devices.append(device_id)
+
+        if not executed_groups and failed_devices:
             return SmartHomeResult(
                 True,
                 "I could not reach the smart extension board.",
-                action=action,
-                devices=devices,
+                action="batch",
+                devices=failed_devices,
             )
 
-        # Verify actual state after the command.
         status = self.get_status()
 
         if status is None:
             return SmartHomeResult(
                 True,
                 "Command sent, but I could not verify the device state.",
-                action=action,
-                devices=devices,
+                action="batch",
+                devices=[device for _, device in executed_groups],
             )
 
-        if failed:
-            failed_names = self._format_device_list(failed)
-            ok_names = self._format_device_list(successful)
+        if failed_devices:
+            fail_names = self._format_device_list(failed_devices)
             return SmartHomeResult(
                 True,
-                f"{ok_names} changed, but {failed_names} failed.",
-                action=action,
-                devices=devices,
+                f"Some devices changed, but {fail_names} failed.",
+                action="batch",
+                devices=[device for _, device in executed_groups],
             )
 
-        if action == "toggle":
-            response = self._format_specific_status(status, devices)
-        else:
-            response = self._format_action_confirmation(status, devices, action)
+        response = self._format_batch_confirmation(commands, status)
 
         return SmartHomeResult(
             True,
             response,
-            action=action,
-            devices=devices,
+            action="batch",
+            devices=[device for _, device in executed_groups],
         )
 
     def _get(self, endpoint: str) -> Optional[str]:
@@ -447,41 +263,52 @@ class SmartHomeEngine:
             "rear": parts[3] == "1",
         }
 
-    def _format_action_confirmation(
+    def _format_batch_confirmation(
         self,
+        commands: list[RoutedCommand],
         status: dict[str, bool],
-        devices: list[str],
-        action: str,
     ) -> str:
-        desired = action == "on"
+        parts = []
 
-        confirmed = [
-            device_id
-            for device_id in devices
-            if status.get(device_id) == desired
-        ]
+        for command in commands:
+            action = command.action
+            devices = self._expand_devices(command.devices)
 
-        not_confirmed = [
-            device_id
-            for device_id in devices
-            if status.get(device_id) != desired
-        ]
+            if action == "toggle":
+                parts.append(self._format_specific_status(status, devices))
+                continue
 
-        if not_confirmed and confirmed:
-            return (
-                f"{self._format_device_list(confirmed)} are {action}, "
-                f"but {self._format_device_list(not_confirmed)} did not confirm."
-            )
+            desired_state = action == "on"
 
-        if not_confirmed and not confirmed:
+            confirmed = [
+                device_id
+                for device_id in devices
+                if status.get(device_id) == desired_state
+            ]
+
+            not_confirmed = [
+                device_id
+                for device_id in devices
+                if status.get(device_id) != desired_state
+            ]
+
+            if confirmed:
+                names = self._format_device_list(confirmed)
+
+                if len(confirmed) == 1:
+                    verb = "are" if self.devices[confirmed[0]]["plural"] else "is"
+                    parts.append(f"{names} {verb} {action}")
+                else:
+                    parts.append(f"{names} are {action}")
+
+            if not_confirmed:
+                names = self._format_device_list(not_confirmed)
+                parts.append(f"{names} did not confirm")
+
+        if not parts:
             return "Command sent, but the state did not change."
 
-        names = self._format_device_list(confirmed)
-
-        if len(confirmed) == 1:
-            return f"{names} is {action}."
-
-        return f"{names} are {action}."
+        return ". ".join(parts) + "."
 
     def _format_specific_status(
         self,
@@ -493,7 +320,8 @@ class SmartHomeEngine:
         for device_id in devices:
             label = self.devices[device_id]["label"]
             state = "on" if status.get(device_id) else "off"
-            parts.append(f"{label} is {state}")
+            verb = "are" if self.devices[device_id]["plural"] else "is"
+            parts.append(f"{label} {verb} {state}")
 
         return self._join_sentence_parts(parts) + "."
 
@@ -510,7 +338,13 @@ class SmartHomeEngine:
         if len(on_devices) == len(self.devices):
             return "Everything is on."
 
-        return f"{self._format_device_list(on_devices)} are on."
+        names = self._format_device_list(on_devices)
+
+        if len(on_devices) == 1:
+            verb = "are" if self.devices[on_devices[0]]["plural"] else "is"
+            return f"{names} {verb} on."
+
+        return f"{names} are on."
 
     def _format_device_list(self, device_ids: list[str]) -> str:
         labels = [self.devices[device_id]["label"] for device_id in device_ids]
