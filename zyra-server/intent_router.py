@@ -51,6 +51,52 @@ class IntentRouter:
                 "empty transcript", []
             )
 
+        text = self._normalize_text(transcript)
+
+        # Hard safety gate:
+        # If the sentence does not look like a smart-home request,
+        # do not send it to the intent router LLM.
+        if not self._is_smart_home_candidate(text):
+            return RoutedIntent(
+                "general",
+                "none",
+                None,
+                [],
+                0.99,
+                "not a smart-home request",
+                [],
+            )
+
+        # Deterministic physical-control parser.
+        # This handles dangerous grammar like:
+        # "everything except TV"
+        # "home theater except sound system"
+        # "turn on TV and turn off everything except surround system"
+        deterministic = self._route_deterministic_control(text)
+
+        if deterministic:
+            logger.info(f"Intent router deterministic control: {deterministic}")
+            return deterministic
+        
+        deterministic_status = self._route_deterministic_status(text)
+
+        if deterministic_status:
+            logger.info(f"Intent router deterministic status: {deterministic_status}")
+            return deterministic_status
+
+        # If an exception command could not be parsed deterministically,
+        # do not let the LLM guess and control physical devices.
+        if any(word in text for word in [" except ", " other than ", " apart from "]):
+            return RoutedIntent(
+                domain="smart_home",
+                intent="control",
+                action=None,
+                devices=[],
+                confidence=0.60,
+                reason="exception command could not be parsed safely",
+                commands=[],
+            )
+
         messages = [
             {
                 "role": "system",
@@ -120,6 +166,418 @@ class IntentRouter:
                 commands=[],
             )
 
+    def _is_smart_home_candidate(self, text: str) -> bool:
+        control_words = [
+            "turn on", "switch on", "power on", "fire up",
+            "activate", "enable", "start",
+            "turn off", "switch off", "power off", "shut down",
+            "shutdown", "kill", "disable", "deactivate", "stop",
+            "toggle", "flip",
+        ]
+
+        status_words = [
+            "status",
+            "what is on",
+            "which is on",
+            "which are on",
+            "what all is on",
+            "which all devices are on",
+            "what devices are on",
+            "check devices",
+            "check device",
+            "is ",
+            "are ",
+        ]
+
+        device_words = [
+            "device",
+            "devices",
+            "relay",
+            "relays",
+            "tv",
+            "television",
+            "sony tv",
+            "soundbar",
+            "sound bar",
+            "speaker bar",
+            "subwoofer",
+            "sub woofer",
+            "woofer",
+            "sub",
+            "rear",
+            "rear speakers",
+            "surround",
+            "surround system",
+            "surround speakers",
+            "back speakers",
+            "sound system",
+            "audio system",
+            "speaker system",
+            "all speakers",
+            "home theater",
+            "home theatre",
+            "full system",
+            "everything",
+            "all devices",
+        ]
+
+        has_device = any(word in text for word in device_words)
+        has_control = any(word in text for word in control_words)
+        has_status = any(word in text for word in status_words)
+
+        return has_device and (has_control or has_status)
+
+
+    def _devices_from_text_fragment(self, fragment: str) -> list[str]:
+        fragment = self._normalize_text(fragment)
+
+        devices: list[str] = []
+
+        def has_phrase(phrase: str) -> bool:
+            return re.search(rf"\b{re.escape(phrase)}\b", fragment) is not None
+
+        def add(device_id: str):
+            if device_id not in devices:
+                devices.append(device_id)
+
+        def add_many(items: list[str]):
+            for item in items:
+                add(item)
+
+        # ── Strong groups first ───────────────────────
+        # These phrases must be treated as exact groups.
+        if any(has_phrase(phrase) for phrase in [
+            "home theater",
+            "home theatre",
+            "full system",
+            "entire system",
+            "everything",
+            "all devices",
+        ]):
+            add_many(["tv", "soundbar", "subwoofer", "rear"])
+
+        if any(has_phrase(phrase) for phrase in [
+            "sound system",
+            "audio system",
+        ]):
+            add_many(["soundbar", "subwoofer"])
+
+        if any(has_phrase(phrase) for phrase in [
+            "speaker system",
+            "all speakers",
+        ]):
+            add_many(["soundbar", "subwoofer", "rear"])
+
+        # Important:
+        # Do NOT treat the bare word "speakers" as all speakers.
+        # It breaks phrases like "rear speakers".
+        if has_phrase("the speakers") and not any(has_phrase(phrase) for phrase in [
+            "rear speakers",
+            "surround speakers",
+            "back speakers",
+        ]):
+            add_many(["soundbar", "subwoofer", "rear"])
+
+        # ── Rear / surround phrases ───────────────────
+        if any(has_phrase(phrase) for phrase in [
+            "surround system",
+            "surround speaker",
+            "surround speakers",
+            "rear system",
+            "rear speaker",
+            "rear speakers",
+            "back speaker",
+            "back speakers",
+        ]):
+            add("rear")
+
+        # ── Individual devices ────────────────────────
+        if re.search(r"\b(tv|television)\b", fragment):
+            add("tv")
+
+        if re.search(r"\b(soundbar|sound bar|speaker bar)\b", fragment):
+            add("soundbar")
+
+        if re.search(r"\b(subwoofer|sub woofer|woofer|sub)\b", fragment):
+            add("subwoofer")
+
+        # Bare "rear" and bare "surround" should mean rear speakers.
+        if re.search(r"\b(rear|surround)\b", fragment):
+            add("rear")
+
+        return devices
+
+
+    def _detect_action_from_clause(
+        self,
+        clause: str,
+        last_action: Optional[str] = None,
+    ) -> Optional[str]:
+        if re.search(
+            r"\b(turn off|switch off|power off|shut down|shutdown|kill|disable|deactivate|stop)\b",
+            clause,
+        ):
+            return "off"
+
+        if re.search(
+            r"\b(turn on|switch on|power on|fire up|activate|enable|start)\b",
+            clause,
+        ):
+            return "on"
+
+        if re.search(r"\b(toggle|flip)\b", clause):
+            return "toggle"
+
+        return last_action
+
+
+    def _parse_control_clause(
+        self,
+        clause: str,
+        last_action: Optional[str],
+        previous_devices: list[str],
+    ) -> Optional[RoutedCommand]:
+        clause = clause.strip()
+
+        if not clause:
+            return None
+
+        action = self._detect_action_from_clause(clause, last_action)
+
+        if not action:
+            return None
+
+        all_devices = ["tv", "soundbar", "subwoofer", "rear"]
+
+        # "everything else" means all devices except devices already mentioned
+        # in previous clauses.
+        if "everything else" in clause or "all else" in clause:
+            excluded = previous_devices
+
+            if not excluded:
+                return None
+
+            devices = [
+                device for device in all_devices
+                if device not in excluded
+            ]
+
+            if not devices:
+                return None
+
+            return RoutedCommand(action, devices)
+
+        # Exception command:
+        # "everything except TV"
+        # "home theater except sound system"
+        # "speaker system except surround system"
+        exception_match = re.search(
+            r"\b(?:except|other than|apart from)\b",
+            clause,
+        )
+
+        if exception_match:
+            base_part = clause[:exception_match.start()].strip()
+            except_part = clause[exception_match.end():].strip()
+
+            base_devices = self._devices_from_text_fragment(base_part)
+            except_devices = self._devices_from_text_fragment(except_part)
+
+            if not base_devices:
+                return None
+
+            if not except_devices:
+                return None
+
+            excluded = list(except_devices)
+
+            # If this is a broad group clause after a previous explicit command,
+            # do not let it undo the earlier command.
+            # Example:
+            # "turn on TV and turn off everything except surround system"
+            # should not turn TV off again.
+            broad_group_words = [
+                "everything",
+                "all devices",
+                "home theater",
+                "home theatre",
+                "full system",
+                "entire system",
+            ]
+
+            is_broad_group = any(word in base_part for word in broad_group_words)
+
+            if is_broad_group:
+                for device in previous_devices:
+                    if device not in excluded:
+                        excluded.append(device)
+
+            devices = [
+                device for device in base_devices
+                if device not in excluded
+            ]
+
+            if not devices:
+                return None
+
+            return RoutedCommand(action, devices)
+
+        devices = self._devices_from_text_fragment(clause)
+
+        if not devices:
+            return None
+
+        return RoutedCommand(action, devices)
+
+    def _route_deterministic_status(self, text: str) -> Optional[RoutedIntent]:
+        status_indicators = [
+            "status",
+            "what is on",
+            "what all is on",
+            "which devices are on",
+            "which all devices are on",
+            "what devices are on",
+            "check devices",
+            "check device",
+        ]
+
+        is_status = any(phrase in text for phrase in status_indicators)
+
+        if not is_status:
+            # Device-specific questions:
+            # "is tv on", "are rear speakers on"
+            is_status = (
+                text.startswith("is ")
+                or text.startswith("are ")
+            )
+
+        if not is_status:
+            return None
+
+        devices = self._devices_from_text_fragment(text)
+
+        if not devices:
+            devices = ["all"]
+
+        return RoutedIntent(
+            domain="smart_home",
+            intent="status",
+            action=None,
+            devices=devices,
+            confidence=0.98,
+            reason="deterministic smart-home status",
+            commands=[],
+        )
+
+    def _route_deterministic_control(self, text: str) -> Optional[RoutedIntent]:
+        control_words = [
+            "turn on", "switch on", "power on", "fire up",
+            "activate", "enable", "start",
+            "turn off", "switch off", "power off", "shut down",
+            "shutdown", "kill", "disable", "deactivate", "stop",
+            "toggle", "flip",
+        ]
+
+        if not any(word in text for word in control_words):
+            return None
+
+        # Split joined command clauses.
+        # Handles:
+        # "turn on TV, turn on subwoofer, turn on rear speakers"
+        # "turn off subwoofer, turn on TV, turn on rear speakers"
+        clauses = re.split(
+            r"\s*(?:,|\b(?:and then|then|also|and)\b)\s*",
+            text,
+        )
+
+        commands: list[RoutedCommand] = []
+        protected_devices: list[str] = []
+        last_action: Optional[str] = None
+
+        for clause in clauses:
+            clause = clause.strip()
+
+            if not clause:
+                continue
+
+            command = self._parse_control_clause(
+                clause,
+                last_action,
+                protected_devices,
+            )
+
+            if not command:
+                continue
+
+            # If a broad later clause tries to control a device that was
+            # already explicitly controlled earlier, protect the earlier intent.
+            safe_devices = [
+                device
+                for device in command.devices
+                if device not in protected_devices
+            ]
+
+            # But if the clause itself is a specific single-device command,
+            # allow it. Example: "turn on TV, turn off TV" should obey order.
+            clause_devices = self._devices_from_text_fragment(clause)
+            is_specific_clause = (
+                len(clause_devices) == 1
+                and clause_devices == command.devices
+            )
+
+            if is_specific_clause:
+                safe_devices = command.devices
+
+            if not safe_devices:
+                continue
+
+            command.devices = safe_devices
+            commands.append(command)
+            last_action = command.action
+
+            for device in command.devices:
+                if device not in protected_devices:
+                    protected_devices.append(device)
+
+        if not commands:
+            return None
+
+        # Merge commands only when action is same.
+        # Do not merge different actions.
+        merged: list[RoutedCommand] = []
+
+        for command in commands:
+            existing_match = None
+
+            for existing in merged:
+                if existing.action == command.action:
+                    existing_match = existing
+                    break
+
+            if existing_match:
+                for device in command.devices:
+                    if device not in existing_match.devices:
+                        existing_match.devices.append(device)
+            else:
+                merged.append(
+                    RoutedCommand(
+                        command.action,
+                        list(command.devices),
+                    )
+                )
+
+        first = merged[0]
+
+        return RoutedIntent(
+            domain="smart_home",
+            intent="control",
+            action=first.action,
+            devices=first.devices,
+            confidence=0.98,
+            reason="deterministic smart-home control",
+            commands=merged,
+        )
+
     def _router_prompt(self) -> str:
         return """
 You are ZYRA's smart-home intent router.
@@ -171,7 +629,9 @@ Rules:
 - If the user asks to fire up/turn on/start/activate something, action is "on".
 - If the user asks to toggle/flip/switch state, action is "toggle".
 - "everything else" means all devices except the device already mentioned in the opposite command.
+- "everything except TV" means all devices except TV. Never include ["all"] when an exception is present.
 - If this is not a smart-home device request, use domain "general", intent "none", action null, devices [], commands [].
+- Movie, music, YouTube, Netflix, or entertainment recommendation questions are general conversation unless the user clearly asks to turn on, turn off, switch, power, toggle, or check a physical device.
 - If uncertain, set confidence below 0.65.
 
 Examples:
@@ -211,6 +671,14 @@ JSON:
 User: "Shut down everything except the TV"
 JSON:
 {"domain":"smart_home","intent":"control","action":"off","devices":["soundbar","subwoofer","rear"],"commands":[{"action":"off","devices":["soundbar","subwoofer","rear"]}],"confidence":0.90,"reason":"everything except TV"}
+
+User: "Turn on everything except TV"
+JSON:
+{"domain":"smart_home","intent":"control","action":"on","devices":["soundbar","subwoofer","rear"],"commands":[{"action":"on","devices":["soundbar","subwoofer","rear"]}],"confidence":0.94,"reason":"turn on every device except TV"}
+
+User: "Can you give me the top 5 scariest horror movies?"
+JSON:
+{"domain":"general","intent":"none","action":null,"devices":[],"commands":[],"confidence":0.99,"reason":"movie recommendation, not device control"}
 
 User: "How are you?"
 JSON:
@@ -294,6 +762,56 @@ JSON:
             ],
         }
 
+        all_physical_devices = ["tv", "soundbar", "subwoofer", "rear"]
+
+        def add_to_list(target: list[str], device_id: str):
+            if device_id not in target:
+                target.append(device_id)
+
+        def devices_from_fragment(fragment: str) -> list[str]:
+            found: list[str] = []
+
+            fragment = fragment.lower().strip()
+            fragment = re.sub(r"[^a-z0-9\s]", " ", fragment)
+            fragment = re.sub(r"\s+", " ", fragment)
+
+            if any(phrase in fragment for phrase in group_aliases["rear_only"]):
+                add_to_list(found, "rear")
+
+            if any(phrase in fragment for phrase in group_aliases["sound_system"]):
+                add_to_list(found, "soundbar")
+                add_to_list(found, "subwoofer")
+
+            if any(phrase in fragment for phrase in group_aliases["all_speakers"]):
+                add_to_list(found, "soundbar")
+                add_to_list(found, "subwoofer")
+                add_to_list(found, "rear")
+
+            if any(phrase in fragment for phrase in alias_map["all"]):
+                for device_id in all_physical_devices:
+                    add_to_list(found, device_id)
+
+            for device_id, aliases in alias_map.items():
+                if device_id == "all":
+                    continue
+
+                for alias in aliases:
+                    if re.search(rf"\b{re.escape(alias)}\b", fragment):
+                        add_to_list(found, device_id)
+                        break
+
+            return found
+
+        except_devices: list[str] = []
+
+        except_match = re.search(
+            r"\b(?:except|other than|apart from)\b(.+)$",
+            text,
+        )
+
+        if except_match:
+            except_devices = devices_from_fragment(except_match.group(1))
+
         def add(device_id: str):
             if device_id not in normalized:
                 normalized.append(device_id)
@@ -342,7 +860,14 @@ JSON:
                 normalized = ["soundbar", "subwoofer", "rear"]
 
             elif any(phrase in text for phrase in alias_map["all"]):
-                normalized = ["all"]
+                if except_devices:
+                    normalized = [
+                        device_id
+                        for device_id in all_physical_devices
+                        if device_id not in except_devices
+                    ]
+                else:
+                    normalized = ["all"]
 
             else:
                 for device_id, aliases in alias_map.items():

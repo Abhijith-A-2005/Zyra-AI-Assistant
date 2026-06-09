@@ -17,8 +17,7 @@ SMART_HOME_BASE_URLS = [
     url.strip().rstrip("/")
     for url in os.getenv(
         "SMART_HOME_BASE_URLS",
-        "http://192.168.29.97," # Replace with the ESP8266's current home Wi-Fi IP.
-        "http://192.168.4.1"   # Default IP for ESP8266 in AP mode
+        "http://192.168.29.97" # Replace with the ESP8266's current home Wi-Fi IP.
     ).split(",")
     if url.strip()
 ]

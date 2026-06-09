@@ -4,11 +4,13 @@ idf_component_register(
         "audio_pipeline.c"
         "websocket_client.c"
         "display.c"
+        "offline_relay.c"
     INCLUDE_DIRS
         "."
     REQUIRES
         #esp-sr
         esp_websocket_client
+        esp_http_client
         esp_driver_i2s
         esp_driver_i2c
         nvs_flash

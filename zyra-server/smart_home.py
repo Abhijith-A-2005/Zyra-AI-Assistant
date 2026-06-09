@@ -103,8 +103,29 @@ class SmartHomeEngine:
         return SmartHomeResult(False, "")
 
     def _expand_devices(self, devices: list[str]) -> list[str]:
-        if not devices or "all" in devices:
-            return ["tv", "soundbar", "subwoofer", "rear"]
+        all_devices = ["tv", "soundbar", "subwoofer", "rear"]
+
+        if not devices:
+            return all_devices
+
+        # ["all"] alone means every device.
+        if devices == ["all"]:
+            return all_devices
+
+        # Safety guard:
+        # If "all" appears mixed with explicit devices, ignore "all".
+        # This prevents mistakes like:
+        # ["soundbar", "subwoofer", "rear", "all"]
+        # from accidentally controlling the TV.
+        if "all" in devices:
+            logger.warning(
+                f"Ignoring mixed 'all' device entry for safety: {devices}"
+            )
+            devices = [
+                device
+                for device in devices
+                if device != "all"
+            ]
 
         expanded = []
 

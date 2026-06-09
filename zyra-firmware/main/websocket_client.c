@@ -14,6 +14,9 @@ static const char* TAG = "WS";
 // ── State ─────────────────────────────────────────
 static esp_websocket_client_handle_t client = NULL;
 static bool     connected       = false;
+static bool     intentional_stop = false;
+static bool     disconnect_notified = false;
+static ws_disconnect_callback_t disconnect_callback = NULL;
 static bool     response_ready  = false;
 static uint8_t* response_buffer = NULL;
 static size_t   response_len    = 0;
@@ -22,6 +25,10 @@ static bool     audio_incoming  = false;
 static size_t   audio_expected  = 0;
 
 static SemaphoreHandle_t response_mutex;
+
+void ws_set_disconnect_callback(ws_disconnect_callback_t callback) {
+    disconnect_callback = callback;
+}
 
 // ── WebSocket event handler ────────────────────────
 static void ws_event_handler(void* arg,
@@ -36,12 +43,26 @@ static void ws_event_handler(void* arg,
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "Connected to ZYRA server");
             connected = true;
+            disconnect_notified = false;
             break;
 
-        case WEBSOCKET_EVENT_DISCONNECTED:
+        case WEBSOCKET_EVENT_DISCONNECTED: {
             ESP_LOGW(TAG, "Disconnected from server");
+
+            bool was_connected = connected;
             connected = false;
+
+            if (was_connected &&
+                !intentional_stop &&
+                !disconnect_notified &&
+                disconnect_callback) {
+
+                disconnect_notified = true;
+                disconnect_callback();
+            }
+
             break;
+        }
 
         case WEBSOCKET_EVENT_DATA:
             if (data->op_code == 0x01) {
@@ -252,11 +273,32 @@ esp_err_t ws_client_init(const char* server_ip,
 
     if (!connected) {
         ESP_LOGE(TAG, "Could not connect to server");
+        ws_client_stop();
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Connected: %s", uri);
     return ESP_OK;
+}
+
+void ws_client_stop(void) {
+    intentional_stop = true;
+
+    if (client) {
+        ESP_LOGW(TAG, "Stopping WebSocket client");
+
+        esp_websocket_client_stop(client);
+        esp_websocket_client_destroy(client);
+        client = NULL;
+    }
+
+    connected = false;
+    response_ready = false;
+    audio_incoming = false;
+    audio_expected = 0;
+    disconnect_notified = false;
+
+    intentional_stop = false;
 }
 
 esp_err_t ws_send_audio(const uint8_t* data,
@@ -311,7 +353,15 @@ void ws_free_response(void) {
 }
 
 bool ws_is_connected(void) {
-    return connected;
+    if (!client) {
+        return false;
+    }
+
+    if (!connected) {
+        return false;
+    }
+
+    return esp_websocket_client_is_connected(client);
 }
 
 esp_err_t ws_send_status(const char* status) {

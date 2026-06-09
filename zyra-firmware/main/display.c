@@ -288,6 +288,24 @@ void display_update(DisplayState state) {
             fb_hline(0, 22, 128);
             fb_text(10, 34, "CHECK SERVER");
             break;
+
+        case DISP_OFFLINE:
+            fb_text(28, 8, "OFFLINE");
+            fb_hline(0, 20, 128);
+            fb_text(12, 34, "RELAY MODE");
+            break;
+
+        case DISP_RELAY_OK:
+            fb_text(28, 8, "RELAY");
+            fb_hline(0, 20, 128);
+            fb_text(40, 34, "OK");
+            break;
+
+        case DISP_RELAY_FAIL:
+            fb_text(28, 8, "RELAY");
+            fb_hline(0, 20, 128);
+            fb_text(28, 34, "FAILED");
+            break;
     }
 
     fb_flush();
