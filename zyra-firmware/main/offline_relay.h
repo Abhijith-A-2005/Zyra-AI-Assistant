@@ -18,12 +18,17 @@ typedef enum {
 
 esp_err_t offline_relay_init(void);
 
+void offline_relay_set_base_url(const char* base_url);
+const char* offline_relay_get_base_url(void);
+
 bool offline_relay_fetch_status(void);
 
 bool offline_relay_get_state(OfflineDevice device);
 
 bool offline_relay_set_device(OfflineDevice device,
                               OfflineAction action);
+
+bool offline_relay_toggle_device(OfflineDevice device);
 
 bool offline_relay_set_all(OfflineAction action);
 

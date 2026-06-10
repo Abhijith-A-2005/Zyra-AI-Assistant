@@ -8,6 +8,7 @@
 #include <string.h>
 
 static const char* TAG = "OFFLINE_RELAY";
+static char relay_base_url[96] = RELAY_HOME_BASE_URL;
 
 typedef struct {
     char* buffer;
@@ -18,6 +19,27 @@ typedef struct {
 static bool relay_states[OFFLINE_DEVICE_COUNT] = {
     false, false, false, false
 };
+
+void offline_relay_set_base_url(const char* base_url) {
+    if (!base_url || base_url[0] == '\0') {
+        return;
+    }
+
+    snprintf(relay_base_url, sizeof(relay_base_url), "%s", base_url);
+
+    // Remove trailing slash if present.
+    size_t len = strlen(relay_base_url);
+    while (len > 0 && relay_base_url[len - 1] == '/') {
+        relay_base_url[len - 1] = '\0';
+        len--;
+    }
+
+    ESP_LOGI(TAG, "Relay base URL set to: %s", relay_base_url);
+}
+
+const char* offline_relay_get_base_url(void) {
+    return relay_base_url;
+}
 
 static const char* device_names[OFFLINE_DEVICE_COUNT] = {
     "TV",
@@ -75,7 +97,7 @@ static esp_err_t offline_http_event_handler(esp_http_client_event_t* evt) {
 }
 
 esp_err_t offline_relay_init(void) {
-    ESP_LOGI(TAG, "Offline relay module ready: %s", RELAY_BASE_URL);
+    ESP_LOGI(TAG, "Offline relay module ready: %s", relay_base_url);
     return ESP_OK;
 }
 
@@ -84,7 +106,7 @@ static bool offline_http_get(const char* endpoint,
                              size_t response_size) {
     char url[128];
 
-    snprintf(url, sizeof(url), "%s%s", RELAY_BASE_URL, endpoint);
+    snprintf(url, sizeof(url), "%s%s", relay_base_url, endpoint);
 
     ESP_LOGI(TAG, "GET %s", url);
 
@@ -232,6 +254,23 @@ bool offline_relay_set_device(OfflineDevice device,
     );
 
     return status_ok;
+}
+
+bool offline_relay_toggle_device(OfflineDevice device) {
+    if (device < 0 || device >= OFFLINE_DEVICE_COUNT) {
+        return false;
+    }
+
+    if (!offline_relay_fetch_status()) {
+        ESP_LOGE(TAG, "Cannot toggle — status fetch failed");
+        return false;
+    }
+
+    OfflineAction next_action = relay_states[device]
+        ? OFFLINE_ACTION_OFF
+        : OFFLINE_ACTION_ON;
+
+    return offline_relay_set_device(device, next_action);
 }
 
 bool offline_relay_set_all(OfflineAction action) {

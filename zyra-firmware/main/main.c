@@ -26,6 +26,7 @@
 #include "websocket_client.h"
 #include "display.h"
 #include "offline_relay.h"
+#include "offline_voice.h"
 
 #define CAPTURE_SAMPLE_RATE 16000
 
@@ -46,13 +47,35 @@ static esp_netif_t* s_sta_netif = NULL;
 #define OFFLINE_AP_RETRY_DELAY_MS       1200
 
 static volatile bool s_switching_wifi = false;
-static volatile bool s_offline_mode   = false;
+
+// This means: server is unavailable, so online voice mode pauses.
+static volatile bool s_offline_mode = false;
+
+// This means: offline relay control is happening through home Wi-Fi.
+static volatile bool s_home_relay_mode = false;
+
+// This means: offline relay control is happening through ESP-REMOTE-DIRECT.
+static volatile bool s_relay_ap_mode = false;
+
 static volatile bool s_force_runtime_fallback = false;
+static volatile bool s_force_direct_ap_fallback = false;
+
 static TaskHandle_t s_runtime_fallback_task_handle = NULL;
+static TaskHandle_t s_server_reconnect_task_handle = NULL;
 static TaskHandle_t s_offline_relay_task_handle = NULL;
-static TaskHandle_t s_zyra_task_handle = NULL; 
+static TaskHandle_t s_zyra_task_handle = NULL;
 
 static void offline_relay_task(void* arg);
+static void zyra_task(void* param);
+static bool start_offline_mode(const char* reason);
+static bool start_home_relay_mode(const char* reason);
+static void request_direct_ap_fallback(const char* reason);
+
+static void handle_offline_voice_command(
+    OfflineVoiceCommand command,
+    const char* phrase,
+    float probability
+);
 
 // ── System state ──────────────────────────────────
 static volatile DisplayState g_state = DISP_BOOTING;
@@ -136,17 +159,30 @@ static void wifi_event_handler(void* arg,
             return;
         }
 
-        // If offline mode is already active and the relay AP drops,
-        // try reconnecting to the relay AP.
-        if (s_offline_mode) {
-            ESP_LOGW(TAG, "Offline AP disconnected, reconnecting");
+        // Direct AP offline mode:
+        // We are already connected to ESP-REMOTE-DIRECT.
+        // If it drops, reconnect to the relay AP.
+        if (s_relay_ap_mode) {
+            ESP_LOGW(TAG, "Direct relay AP disconnected, reconnecting");
             esp_wifi_connect();
             return;
         }
 
-        // Normal online mode reconnect.
-        ESP_LOGW(TAG, "WiFi disconnected, retrying home WiFi");
+        // Home relay offline mode:
+        // We were using the ESP8266 through home Wi-Fi.
+        // If home Wi-Fi drops, escalate to direct AP fallback.
+        if (s_home_relay_mode) {
+            ESP_LOGE(TAG, "Home WiFi lost during home relay mode");
+            request_direct_ap_fallback("home WiFi lost during home relay mode");
+            return;
+        }
+
+        // Online mode:
+        // Home Wi-Fi itself dropped while server mode was active.
+        // Try once to reconnect home Wi-Fi, but also schedule direct AP fallback.
+        ESP_LOGW(TAG, "Home WiFi disconnected during online mode");
         esp_wifi_connect();
+        request_direct_ap_fallback("home WiFi lost during online mode");
 
     } else if (base == IP_EVENT &&
                id == IP_EVENT_STA_GOT_IP) {
@@ -249,7 +285,7 @@ static void configure_offline_static_ip(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "Offline static IP configured: 192.168.4.2");
+    ESP_LOGI(TAG, "Offline static IP configured: 192.168.4.50");
 }
 
 static bool wifi_connect_offline_relay_ap(void) {
@@ -409,25 +445,189 @@ static void request_runtime_offline_fallback(bool force) {
     }
 }
 
+static void request_direct_ap_fallback(const char* reason) {
+    if (s_switching_wifi || s_relay_ap_mode) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Direct AP fallback requested: %s", reason);
+
+    s_force_direct_ap_fallback = true;
+
+    if (s_runtime_fallback_task_handle) {
+        xTaskNotifyGive(s_runtime_fallback_task_handle);
+    }
+}
+
 static void websocket_lost_callback(void) {
     request_runtime_offline_fallback(false);
 }
 
+static void handle_offline_voice_command(
+    OfflineVoiceCommand command,
+    const char* phrase,
+    float probability
+) {
+    if (!s_offline_mode || s_switching_wifi) {
+        ESP_LOGW(TAG, "Ignoring offline voice command outside offline mode");
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Offline voice command: id=%d phrase='%s' prob=%.3f",
+        command,
+        phrase ? phrase : "",
+        probability
+    );
+
+    set_state(DISP_PROCESSING);
+
+    bool ok = false;
+
+    switch (command) {
+        case OFFLINE_VOICE_CMD_TV_ON:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_TV,
+                OFFLINE_ACTION_ON
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_TV_OFF:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_TV,
+                OFFLINE_ACTION_OFF
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_TV_TOGGLE:
+            ok = offline_relay_toggle_device(OFFLINE_DEVICE_TV);
+            break;
+
+        case OFFLINE_VOICE_CMD_SOUNDBAR_ON:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_SOUNDBAR,
+                OFFLINE_ACTION_ON
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_SOUNDBAR_OFF:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_SOUNDBAR,
+                OFFLINE_ACTION_OFF
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_SOUNDBAR_TOGGLE:
+            ok = offline_relay_toggle_device(OFFLINE_DEVICE_SOUNDBAR);
+            break;
+
+        case OFFLINE_VOICE_CMD_SUBWOOFER_ON:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_SUBWOOFER,
+                OFFLINE_ACTION_ON
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_SUBWOOFER_OFF:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_SUBWOOFER,
+                OFFLINE_ACTION_OFF
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_SUBWOOFER_TOGGLE:
+            ok = offline_relay_toggle_device(OFFLINE_DEVICE_SUBWOOFER);
+            break;
+
+        case OFFLINE_VOICE_CMD_REAR_ON:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_REAR,
+                OFFLINE_ACTION_ON
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_REAR_OFF:
+            ok = offline_relay_set_device(
+                OFFLINE_DEVICE_REAR,
+                OFFLINE_ACTION_OFF
+            );
+            break;
+
+        case OFFLINE_VOICE_CMD_REAR_TOGGLE:
+            ok = offline_relay_toggle_device(OFFLINE_DEVICE_REAR);
+            break;
+
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_ON:
+            ok = offline_relay_set_sound_system(OFFLINE_ACTION_ON);
+            break;
+
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_OFF:
+            ok = offline_relay_set_sound_system(OFFLINE_ACTION_OFF);
+            break;
+
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_ON:
+            ok = offline_relay_set_all_speakers(OFFLINE_ACTION_ON);
+            break;
+
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_OFF:
+            ok = offline_relay_set_all_speakers(OFFLINE_ACTION_OFF);
+            break;
+
+        case OFFLINE_VOICE_CMD_HOME_THEATER_ON:
+            ok = offline_relay_set_home_theater(OFFLINE_ACTION_ON);
+            break;
+
+        case OFFLINE_VOICE_CMD_HOME_THEATER_OFF:
+            ok = offline_relay_set_home_theater(OFFLINE_ACTION_OFF);
+            break;
+
+        case OFFLINE_VOICE_CMD_STATUS:
+            ok = offline_relay_fetch_status();
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unknown offline voice command: %d", command);
+            ok = false;
+            break;
+    }
+
+    if (ok) {
+        ESP_LOGI(TAG, "Offline voice command executed successfully");
+        set_state(DISP_RELAY_OK);
+    } else {
+        ESP_LOGE(TAG, "Offline voice command failed");
+        set_state(DISP_RELAY_FAIL);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(900));
+
+    if (s_offline_mode) {
+        set_state(DISP_OFFLINE);
+    }
+}
+
 static bool start_offline_mode(const char* reason) {
-    if (s_offline_mode && !s_switching_wifi) {
-        ESP_LOGW(TAG, "Offline mode already active");
+    if (s_offline_mode && s_relay_ap_mode && !s_switching_wifi) {
+        ESP_LOGW(TAG, "Direct AP offline mode already active");
         return true;
     }
 
-    ESP_LOGW(TAG, "Entering offline relay mode: %s", reason);
+    ESP_LOGW(TAG, "Entering direct AP offline relay mode: %s", reason);
 
     s_offline_mode = true;
+    s_home_relay_mode = false;
+    s_relay_ap_mode = true;
+
     set_state(DISP_OFFLINE);
 
     ws_client_stop();
 
+    offline_relay_set_base_url(RELAY_AP_BASE_URL);
+
     if (!wifi_connect_offline_relay_ap()) {
-        ESP_LOGE(TAG, "Failed to enter offline relay mode");
+        ESP_LOGE(TAG, "Failed to enter direct AP offline relay mode");
+        s_relay_ap_mode = false;
         set_state(DISP_RELAY_FAIL);
         return false;
     }
@@ -444,9 +644,61 @@ static bool start_offline_mode(const char* reason) {
         );
     }
 
+    offline_voice_start(handle_offline_voice_command);
+
     set_state(DISP_OFFLINE);
 
-    ESP_LOGI(TAG, "ZYRA switched to offline relay mode");
+    ESP_LOGI(TAG, "ZYRA switched to direct AP offline relay mode");
+    return true;
+}
+
+static bool start_home_relay_mode(const char* reason) {
+    if (s_offline_mode && s_home_relay_mode && !s_switching_wifi) {
+        ESP_LOGW(TAG, "Home relay offline mode already active");
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Entering home relay offline mode: %s", reason);
+
+    s_offline_mode = true;
+    s_home_relay_mode = true;
+    s_relay_ap_mode = false;
+
+    set_state(DISP_OFFLINE);
+
+    // Stop WebSocket only. Do NOT disconnect home Wi-Fi.
+    ws_client_stop();
+
+    offline_relay_set_base_url(RELAY_HOME_BASE_URL);
+    offline_relay_init();
+
+    // Confirm ESP8266 is reachable on home Wi-Fi.
+    if (!offline_relay_fetch_status()) {
+        ESP_LOGW(TAG, "Home relay IP not reachable. Falling back to direct AP mode.");
+
+        s_home_relay_mode = false;
+        s_offline_mode = false;
+
+        return start_offline_mode("home relay unavailable");
+    }
+
+    if (s_offline_relay_task_handle == NULL) {
+        xTaskCreatePinnedToCore(
+            offline_relay_task,
+            "OfflineRelay",
+            4096,
+            NULL,
+            4,
+            &s_offline_relay_task_handle,
+            0
+        );
+    }
+
+    offline_voice_start(handle_offline_voice_command);
+
+    set_state(DISP_OFFLINE);
+
+    ESP_LOGI(TAG, "ZYRA switched to home relay offline mode");
     return true;
 }
 
@@ -454,7 +706,25 @@ static void runtime_fallback_task(void* arg) {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        if (s_offline_mode || s_switching_wifi) {
+        if (s_switching_wifi) {
+            continue;
+        }
+
+        if (s_force_direct_ap_fallback) {
+            s_force_direct_ap_fallback = false;
+
+            ESP_LOGE(TAG, "Home WiFi unavailable, switching to direct AP relay mode");
+
+            // Clear home relay state before switching to direct AP.
+            s_offline_mode = false;
+            s_home_relay_mode = false;
+            s_relay_ap_mode = false;
+
+            start_offline_mode("home WiFi unavailable");
+            continue;
+        }
+
+        if (s_offline_mode) {
             continue;
         }
 
@@ -492,7 +762,63 @@ static void runtime_fallback_task(void* arg) {
 
         ESP_LOGE(TAG, "%s", log_reason);
 
-        start_offline_mode(offline_reason);
+        start_home_relay_mode(offline_reason);
+    }
+}
+
+static void server_reconnect_task(void* arg) {
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(15000));
+
+        // Only try reconnecting when we are in home relay fallback.
+        // In direct AP mode, Zyra is no longer on home Wi-Fi.
+        if (!s_offline_mode || !s_home_relay_mode || s_relay_ap_mode) {
+            continue;
+        }
+
+        if (s_switching_wifi) {
+            continue;
+        }
+
+        if (ws_is_connected()) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Checking if ZYRA server is back...");
+
+        esp_err_t err = ws_client_init(SERVER_IP, SERVER_PORT);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Server still unavailable");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Server restored. Switching back to online mode.");
+
+        offline_voice_stop();
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        s_offline_mode = false;
+        s_home_relay_mode = false;
+        s_relay_ap_mode = false;
+        s_force_runtime_fallback = false;
+
+        set_state(DISP_IDLE);
+
+        // If Zyra task was never started because server was down during boot,
+        // start it now.
+        if (s_zyra_task_handle == NULL) {
+            xTaskCreatePinnedToCore(
+                zyra_task,
+                "ZYRA",
+                16384,
+                NULL,
+                5,
+                &s_zyra_task_handle,
+                0
+            );
+        }
     }
 }
 
@@ -751,6 +1077,17 @@ static void offline_relay_task(void* param) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
 
+         if (s_switching_wifi) {
+            continue;
+        }
+
+        if (!s_offline_mode) {
+            ESP_LOGI(TAG, "Offline relay task stopping because online mode returned");
+            s_offline_relay_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+
         if (offline_relay_fetch_status()) {
             ESP_LOGI(TAG, "Offline relay live");
         } else {
@@ -784,15 +1121,10 @@ void app_main(void) {
     if (!wifi_init()) {
         ESP_LOGE(TAG, "Home WiFi failed");
 
-        if (wifi_connect_offline_relay_ap()) {
-            audio_pipeline_init();
+        audio_pipeline_init();
 
-            xTaskCreatePinnedToCore(
-                offline_relay_task, "OfflineRelay",
-                8192, NULL, 5, NULL, 0
-            );
-
-            ESP_LOGI(TAG, "ZYRA offline relay mode active");
+        if (start_offline_mode("home WiFi unavailable during boot")) {
+            ESP_LOGI(TAG, "ZYRA direct AP offline relay mode active");
             return;
         }
 
@@ -816,6 +1148,16 @@ void app_main(void) {
         0
     );
 
+    xTaskCreatePinnedToCore(
+        server_reconnect_task,
+        "ServerRetry",
+        4096,
+        NULL,
+        4,
+        &s_server_reconnect_task_handle,
+        0
+    );
+
     ESP_LOGI(TAG, "Connecting to server...");
     esp_err_t ws_err = ws_client_init(
         SERVER_IP, SERVER_PORT);
@@ -823,7 +1165,7 @@ void app_main(void) {
     if (ws_err != ESP_OK) {
         ESP_LOGE(TAG, "Server connection failed");
 
-        start_offline_mode("server unavailable during boot");
+        start_home_relay_mode("server unavailable during boot");
         return;
     }
 
