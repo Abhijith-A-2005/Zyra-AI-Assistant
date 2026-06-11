@@ -15,6 +15,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "wakeword_engine.h"
+
 static const char* TAG = "OFFLINE_VOICE";
 
 #define OFFLINE_VOICE_TASK_STACK       8192
@@ -317,6 +319,16 @@ static void offline_voice_task(void* arg) {
     s_multinet->clean(s_model_data);
 
     while (s_voice_running) {
+        ESP_LOGI(TAG, "Offline mode waiting for wake word");
+
+        if (!wakeword_wait_blocking()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Offline wake detected. Listening for command.");
+        s_multinet->clean(s_model_data);
+
         int filled = 0;
 
         while (filled < chunk_size && s_voice_running) {

@@ -161,24 +161,36 @@ esp_err_t audio_pipeline_init(void) {
 
 int audio_read_wakenet_frame(int16_t* buffer,
                               int frame_len) {
+    if (!buffer || frame_len <= 0) {
+        return 0;
+    }
+
     if (!rx_handle) {
-        memset(buffer, 0,
-               frame_len * sizeof(int16_t));
+        memset(buffer, 0, frame_len * sizeof(int16_t));
         return frame_len;
     }
 
     int32_t raw[frame_len];
-    size_t  bytes = 0;
-    esp_err_t err = i2s_channel_read(
-        rx_handle, raw,
-        frame_len * sizeof(int32_t),
-        &bytes, pdMS_TO_TICKS(100));
+    size_t bytes = 0;
 
-    if (err != ESP_OK) return 0;
+    esp_err_t err = i2s_channel_read(
+        rx_handle,
+        raw,
+        frame_len * sizeof(int32_t),
+        &bytes,
+        pdMS_TO_TICKS(300)
+    );
+
+    if (err != ESP_OK || bytes == 0) {
+        return 0;
+    }
 
     int count = bytes / sizeof(int32_t);
-    for (int i = 0; i < count; i++)
+
+    for (int i = 0; i < count; i++) {
         buffer[i] = (int16_t)(raw[i] >> 16);
+    }
+
     return count;
 }
 

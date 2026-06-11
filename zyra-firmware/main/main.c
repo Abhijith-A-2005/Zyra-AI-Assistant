@@ -17,17 +17,15 @@
 #include "esp_heap_caps.h"
 
 // ESP-SR
-
-// ESP-SR removed for stable VAD-only mode.
-// Wake word will be added later only after the base assistant is stable.
+#include "offline_voice.h"
+#include "offline_speech.h"
+#include "wakeword_engine.h"
 
 // Our modules
 #include "audio_pipeline.h"
 #include "websocket_client.h"
 #include "display.h"
 #include "offline_relay.h"
-#include "offline_voice.h"
-#include "offline_speech.h"
 
 #define CAPTURE_SAMPLE_RATE 16000
 
@@ -1015,7 +1013,7 @@ static void zyra_task(void* param) {
 
     // ── VAD settings ──────────────────────────────
     // Frame = 256 samples @ 16kHz = 16ms per frame
-    #define VAD_SPEECH_THRESHOLD       1200  // must exceed to count as speech
+    #define VAD_SPEECH_THRESHOLD       800  // must exceed to count as speech
     #define VAD_SILENCE_THRESHOLD      1200  // below this = silence
     #define VAD_TRIGGER_FRAMES            7  // ~160ms continuous speech to trigger
     #define VAD_SPEECH_FRAMES_MIN        12  // ~400ms real speech required
@@ -1024,6 +1022,7 @@ static void zyra_task(void* param) {
     #define VAD_MIN_CAPTURE_BYTES      8000  // 0.5 sec at 16kHz 16-bit
     #define VAD_QUIET_FRAMES_START       25  // wait for quiet before listening
     #define VAD_POST_SPEAK_COOLDOWN_MS  900  // prevent self-trigger after speaking
+    #define VAD_WAKE_COMMAND_TIMEOUT_MS 4500  // max time to wait for command after wake word
 
     size_t max_capture = (CAPTURE_SAMPLE_RATE * 2 * VAD_MAX_CAPTURE_MS) / 1000;
 
@@ -1064,34 +1063,61 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
             continue;
         }
 
-        // ── PHASE 1: Wait for quiet, then wait for speech ─
+        // ── PHASE 0: Wait for wake word ───────────────────
         set_state(DISP_IDLE);
 
-        // Make sure the mic is quiet before accepting a new command.
-        // This prevents speaker echo/noise from triggering THINKING.
+        if (!wakeword_wait_blocking()) {
+            set_state(DISP_ERROR);
+            continue;
+        }
+
+        set_state(DISP_WAKE_DETECTED);
+
+        // Avoid capturing the tail of "Jarvis" as the command.
+        vTaskDelay(pdMS_TO_TICKS(250));
+        drain_mic_frames(8);
+
+        // ── PHASE 1: Wait for quiet, then capture command ─
         wait_for_quiet(VAD_QUIET_FRAMES_START, VAD_SILENCE_THRESHOLD);
 
-int pre_speech_frames = 0;
+        int pre_speech_frames = 0;
+        bool speech_detected = false;
+        TickType_t speech_wait_start = xTaskGetTickCount();
 
         while (true) {
+            uint32_t elapsed_ms =
+                (xTaskGetTickCount() - speech_wait_start) * portTICK_PERIOD_MS;
+
+            if (elapsed_ms >= VAD_WAKE_COMMAND_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "No speech after wake word — returning to idle");
+                set_state(DISP_IDLE);
+                drain_mic_frames(6);
+                break;
+            }
+
             int count = audio_read_wakenet_frame(frame, 256);
             if (count <= 0) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
-            // RMS energy — more stable than peak for VAD
             int32_t rms = calculate_rms(frame, count);
 
             if (rms > VAD_SPEECH_THRESHOLD) {
                 pre_speech_frames++;
+
                 if (pre_speech_frames >= VAD_TRIGGER_FRAMES) {
                     ESP_LOGI(TAG, "Speech detected (RMS=%" PRId32 ")", rms);
+                    speech_detected = true;
                     break;
                 }
             } else {
                 pre_speech_frames = 0;
             }
+        }
+
+        if (!speech_detected) {
+            continue;
         }
 
         // ── PHASE 2: Capture utterance ─────────────
@@ -1294,6 +1320,13 @@ void app_main(void) {
         ESP_LOGE(TAG, "Home WiFi failed");
 
         audio_pipeline_init();
+
+        if (wakeword_engine_init() != ESP_OK) {
+            ESP_LOGE(TAG, "Wakeword engine failed");
+            set_state(DISP_ERROR);
+            return;
+        }
+
         offline_speech_init();
 
         if (start_offline_mode("home WiFi unavailable during boot")) {
@@ -1308,6 +1341,13 @@ void app_main(void) {
     set_state(DISP_PROCESSING);
 
     audio_pipeline_init();
+
+    if (wakeword_engine_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Wakeword engine failed");
+        set_state(DISP_ERROR);
+        return;
+    }
+
     offline_speech_init();
 
     ws_set_disconnect_callback(websocket_lost_callback);

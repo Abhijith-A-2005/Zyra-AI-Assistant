@@ -7,6 +7,7 @@ idf_component_register(
         "offline_relay.c"
         "offline_voice.c"
         "offline_speech.c"
+        "wakeword_engine.c"
     INCLUDE_DIRS
         "."
     REQUIRES
