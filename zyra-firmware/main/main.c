@@ -27,6 +27,7 @@
 #include "display.h"
 #include "offline_relay.h"
 #include "offline_voice.h"
+#include "offline_speech.h"
 
 #define CAPTURE_SAMPLE_RATE 16000
 
@@ -70,6 +71,148 @@ static void zyra_task(void* param);
 static bool start_offline_mode(const char* reason);
 static bool start_home_relay_mode(const char* reason);
 static void request_direct_ap_fallback(const char* reason);
+
+static void set_state(DisplayState state);
+static void drain_mic_frames(int frames);
+
+static const char* offline_command_label(OfflineVoiceCommand command) {
+    switch (command) {
+        case OFFLINE_VOICE_CMD_TV_ON: return "TV ON";
+        case OFFLINE_VOICE_CMD_TV_OFF: return "TV OFF";
+        case OFFLINE_VOICE_CMD_TV_TOGGLE: return "TV TOGGLE";
+
+        case OFFLINE_VOICE_CMD_SOUNDBAR_ON: return "SOUNDBAR ON";
+        case OFFLINE_VOICE_CMD_SOUNDBAR_OFF: return "SOUNDBAR OFF";
+        case OFFLINE_VOICE_CMD_SOUNDBAR_TOGGLE: return "SOUNDBAR TOGGLE";
+
+        case OFFLINE_VOICE_CMD_SUBWOOFER_ON: return "SUBWOOFER ON";
+        case OFFLINE_VOICE_CMD_SUBWOOFER_OFF: return "SUBWOOFER OFF";
+        case OFFLINE_VOICE_CMD_SUBWOOFER_TOGGLE: return "SUBWOOFER TOGGLE";
+
+        case OFFLINE_VOICE_CMD_REAR_ON: return "REAR ON";
+        case OFFLINE_VOICE_CMD_REAR_OFF: return "REAR OFF";
+        case OFFLINE_VOICE_CMD_REAR_TOGGLE: return "REAR TOGGLE";
+
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_ON: return "SOUND SYSTEM ON";
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_OFF: return "SOUND SYSTEM OFF";
+
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_ON: return "ALL SPEAKERS ON";
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_OFF: return "ALL SPEAKERS OFF";
+
+        case OFFLINE_VOICE_CMD_HOME_THEATER_ON: return "HOME THEATER ON";
+        case OFFLINE_VOICE_CMD_HOME_THEATER_OFF: return "HOME THEATER OFF";
+
+        case OFFLINE_VOICE_CMD_STATUS: return "STATUS";
+
+        default: return "UNKNOWN COMMAND";
+    }
+}
+
+static const char* offline_command_prompt(OfflineVoiceCommand command) {
+    switch (command) {
+        case OFFLINE_VOICE_CMD_TV_ON: return "tv_on.wav";
+        case OFFLINE_VOICE_CMD_TV_OFF: return "tv_off.wav";
+
+        case OFFLINE_VOICE_CMD_SOUNDBAR_ON: return "soundbar_on.wav";
+        case OFFLINE_VOICE_CMD_SOUNDBAR_OFF: return "soundbar_off.wav";
+
+        case OFFLINE_VOICE_CMD_SUBWOOFER_ON: return "subwoofer_on.wav";
+        case OFFLINE_VOICE_CMD_SUBWOOFER_OFF: return "subwoofer_off.wav";
+
+        case OFFLINE_VOICE_CMD_REAR_ON: return "rear_on.wav";
+        case OFFLINE_VOICE_CMD_REAR_OFF: return "rear_off.wav";
+
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_ON: return "sound_system_on.wav";
+        case OFFLINE_VOICE_CMD_SOUND_SYSTEM_OFF: return "sound_system_off.wav";
+
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_ON: return "all_speakers_on.wav";
+        case OFFLINE_VOICE_CMD_ALL_SPEAKERS_OFF: return "all_speakers_off.wav";
+
+        case OFFLINE_VOICE_CMD_HOME_THEATER_ON: return "home_theater_on.wav";
+        case OFFLINE_VOICE_CMD_HOME_THEATER_OFF: return "home_theater_off.wav";
+
+        case OFFLINE_VOICE_CMD_STATUS: return "status.wav";
+
+        default: return "done.wav";
+    }
+}
+
+static void show_offline_status_on_display(void) {
+    char line1[22];
+    char line2[22];
+
+    snprintf(
+        line1,
+        sizeof(line1),
+        "TV:%s SB:%s",
+        offline_relay_get_state(OFFLINE_DEVICE_TV) ? "ON" : "OFF",
+        offline_relay_get_state(OFFLINE_DEVICE_SOUNDBAR) ? "ON" : "OFF"
+    );
+
+    snprintf(
+        line2,
+        sizeof(line2),
+        "SUB:%s REAR:%s",
+        offline_relay_get_state(OFFLINE_DEVICE_SUBWOOFER) ? "ON" : "OFF",
+        offline_relay_get_state(OFFLINE_DEVICE_REAR) ? "ON" : "OFF"
+    );
+
+    display_show_message("OFFLINE STATUS", line1, line2);
+}
+
+static const char* offline_status_prompt_filename(void) {
+    static char filename[24];
+
+    bool tv = offline_relay_get_state(OFFLINE_DEVICE_TV);
+    bool sb = offline_relay_get_state(OFFLINE_DEVICE_SOUNDBAR);
+    bool sub = offline_relay_get_state(OFFLINE_DEVICE_SUBWOOFER);
+    bool rear = offline_relay_get_state(OFFLINE_DEVICE_REAR);
+
+    snprintf(
+        filename,
+        sizeof(filename),
+        "status_%d%d%d%d.wav",
+        tv ? 1 : 0,
+        sb ? 1 : 0,
+        sub ? 1 : 0,
+        rear ? 1 : 0
+    );
+
+    return filename;
+}
+
+static void play_offline_response(OfflineVoiceCommand command, bool ok) {
+    /*
+    set_state(DISP_SPEAKING); // DISP_SPEAKING disabled.
+       
+       Offline voice response should play in the background while the OLED
+       keeps showing the useful result screen:
+       - COMMAND DONE
+       - COMMAND FAILED
+       - OFFLINE STATUS
+    */
+
+    if (!ok) {
+        if (offline_speech_play("failed.wav") != ESP_OK) {
+            ESP_LOGW(TAG, "Failed prompt missing");
+        }
+    } else if (command == OFFLINE_VOICE_CMD_STATUS) {
+        const char* status_prompt = offline_status_prompt_filename();
+
+        if (offline_speech_play(status_prompt) != ESP_OK) {
+            ESP_LOGW(TAG, "Specific status prompt missing: %s", status_prompt);
+            offline_speech_play("status.wav");
+        }
+    } else {
+        const char* prompt = offline_command_prompt(command);
+
+        if (offline_speech_play(prompt) != ESP_OK) {
+            offline_speech_play("done.wav");
+        }
+    }
+
+    drain_mic_frames(35);
+}
 
 static void handle_offline_voice_command(
     OfflineVoiceCommand command,
@@ -481,6 +624,12 @@ static void handle_offline_voice_command(
         probability
     );
 
+    display_show_message(
+        "OFFLINE COMMAND",
+        offline_command_label(command),
+        "WORKING"
+    );
+
     set_state(DISP_PROCESSING);
 
     bool ok = false;
@@ -594,17 +743,40 @@ static void handle_offline_voice_command(
 
     if (ok) {
         ESP_LOGI(TAG, "Offline voice command executed successfully");
-        set_state(DISP_RELAY_OK);
+
+        if (command == OFFLINE_VOICE_CMD_STATUS) {
+            show_offline_status_on_display();
+        } else {
+            display_show_message(
+                "COMMAND DONE",
+                offline_command_label(command),
+                "SUCCESS"
+            );
+        }
     } else {
         ESP_LOGE(TAG, "Offline voice command failed");
-        set_state(DISP_RELAY_FAIL);
+
+        display_show_message(
+            "COMMAND FAILED",
+            offline_command_label(command),
+            "CHECK RELAY"
+        );
     }
 
-    vTaskDelay(pdMS_TO_TICKS(900));
+    play_offline_response(command, ok);
 
     if (s_offline_mode) {
-        set_state(DISP_OFFLINE);
+        if (command == OFFLINE_VOICE_CMD_STATUS && ok) {
+            // Keep the status screen visible briefly after reading it aloud.
+            vTaskDelay(pdMS_TO_TICKS(4000));
+            set_state(DISP_OFFLINE);
+        } else {
+            // Normal command result screen stays briefly, then returns to offline idle.
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            set_state(DISP_OFFLINE);
+        }
     }
+
 }
 
 static bool start_offline_mode(const char* reason) {
@@ -1122,6 +1294,7 @@ void app_main(void) {
         ESP_LOGE(TAG, "Home WiFi failed");
 
         audio_pipeline_init();
+        offline_speech_init();
 
         if (start_offline_mode("home WiFi unavailable during boot")) {
             ESP_LOGI(TAG, "ZYRA direct AP offline relay mode active");
@@ -1135,6 +1308,7 @@ void app_main(void) {
     set_state(DISP_PROCESSING);
 
     audio_pipeline_init();
+    offline_speech_init();
 
     ws_set_disconnect_callback(websocket_lost_callback);
 

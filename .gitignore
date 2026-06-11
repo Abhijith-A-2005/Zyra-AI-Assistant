@@ -75,3 +75,6 @@ zyra-server/smart_home.local.yaml
 zyra-server/smart_home.local.yml
 zyra-server/*secret*
 zyra-server/*secrets*
+# Repomix exports
+*-repomix-output.xml
+zyra-repomix-output.xml

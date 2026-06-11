@@ -12,10 +12,14 @@ typedef enum {
     DISP_ERROR,
     DISP_OFFLINE,
     DISP_RELAY_OK,
-    DISP_RELAY_FAIL
+    DISP_RELAY_FAIL,
+    DISP_CUSTOM
 } DisplayState;
 
 esp_err_t display_init(void);
 void display_set_state(DisplayState state);
 void display_update(DisplayState state);
 void display_task(void* param);
+void display_show_message(const char* title,
+                          const char* line1,
+                          const char* line2);

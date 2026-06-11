@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -21,6 +22,20 @@ static volatile DisplayState current_state
     = DISP_BOOTING;
 void display_set_state(DisplayState state) {
     current_state = state;
+}
+
+static char custom_title[22] = "";
+static char custom_line1[22] = "";
+static char custom_line2[22] = "";
+
+void display_show_message(const char* title,
+                          const char* line1,
+                          const char* line2) {
+    snprintf(custom_title, sizeof(custom_title), "%s", title ? title : "");
+    snprintf(custom_line1, sizeof(custom_line1), "%s", line1 ? line1 : "");
+    snprintf(custom_line2, sizeof(custom_line2), "%s", line2 ? line2 : "");
+
+    current_state = DISP_CUSTOM;
 }
 
 // ── I2C write ─────────────────────────────────────
@@ -306,6 +321,13 @@ void display_update(DisplayState state) {
             fb_hline(0, 20, 128);
             fb_text(28, 34, "FAILED");
             break;
+
+        case DISP_CUSTOM:
+            fb_text(0, 2, custom_title);
+            fb_hline(0, 14, 128);
+            fb_text(0, 24, custom_line1);
+            fb_text(0, 42, custom_line2);
+            break;
     }
 
     fb_flush();
@@ -314,6 +336,6 @@ void display_update(DisplayState state) {
 void display_task(void* param) {
     while (true) {
         display_update(current_state);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(250)); // OLED refresh rate (more -> slow)
     }
 }

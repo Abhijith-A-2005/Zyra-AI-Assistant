@@ -6,6 +6,7 @@ idf_component_register(
         "display.c"
         "offline_relay.c"
         "offline_voice.c"
+        "offline_speech.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -20,8 +21,10 @@ idf_component_register(
         esp_netif
         freertos
         json
+        spiffs
         log
     PRIV_REQUIRES
         esp_timer
 )
+spiffs_create_partition_image(storage ../spiffs FLASH_IN_PROJECT)
 target_link_libraries(${COMPONENT_LIB} PRIVATE m)
