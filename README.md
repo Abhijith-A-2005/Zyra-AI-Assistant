@@ -4,9 +4,9 @@ ZYRA is a custom local smart home voice assistant built using an **ESP32-S3** an
 
 The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
 
-The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, and intelligently understand smart-home commands such as turning devices on, turning devices off, and controlling grouped home-theater devices without depending on cloud assistants.
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display,wake through a local hardware wakeword, and intelligently understand smart-home commands such as turning devices on, turning devices off, checking device status, and controlling grouped home-theater devices without depending on cloud assistants.
 
-The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface and offline connectivity support.
+The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, and offline relay connectivity support.
 
 
 The project now includes:
@@ -17,12 +17,14 @@ The project now includes:
 * Firmware-side offline relay fallback
 * Firmware-side offline speech connectivity support
 * SPIFFS-based offline assets
+* Local wakeword firmware
 
 ---
 
+
 ## Project Structure
 
-```text id="uq3brb"
+```text
 ZYRA/
 ├── README.md
 ├── .gitignore
@@ -51,7 +53,39 @@ ZYRA/
     ├── partitions.csv
     ├── sdkconfig
     ├── spiffs/
-    │   └── offline speech / command assets
+    │   ├── all_speakers_off.wav
+    │   ├── all_speakers_on.wav
+    │   ├── done.wav
+    │   ├── failed.wav
+    │   ├── home_theater_off.wav
+    │   ├── home_theater_on.wav
+    │   ├── rear_off.wav
+    │   ├── rear_on.wav
+    │   ├── sound_system_off.wav
+    │   ├── sound_system_on.wav
+    │   ├── soundbar_off.wav
+    │   ├── soundbar_on.wav
+    │   ├── status.wav
+    │   ├── status_0000.wav
+    │   ├── status_0001.wav
+    │   ├── status_0010.wav
+    │   ├── status_0011.wav
+    │   ├── status_0100.wav
+    │   ├── status_0101.wav
+    │   ├── status_0110.wav
+    │   ├── status_0111.wav
+    │   ├── status_1000.wav
+    │   ├── status_1001.wav
+    │   ├── status_1010.wav
+    │   ├── status_1011.wav
+    │   ├── status_1100.wav
+    │   ├── status_1101.wav
+    │   ├── status_1110.wav
+    │   ├── status_1111.wav
+    │   ├── subwoofer_off.wav
+    │   ├── subwoofer_on.wav
+    │   ├── tv_off.wav
+    │   └── tv_on.wav
     │
     └── main/
         ├── CMakeLists.txt
@@ -65,6 +99,10 @@ ZYRA/
         ├── offline_relay.h
         ├── offline_speech.c
         ├── offline_speech.h
+        ├── offline_voice.c
+        ├── offline_voice.h
+        ├── wakeword_engine.c
+        ├── wakeword_engine.h
         ├── websocket_client.c
         ├── websocket_client.h
         └── zyra_config.example.h
@@ -116,12 +154,13 @@ The ESP32-S3 firmware.
 It handles:
 
 * Wi-Fi connection
+* Local Jarvis wakeword detection using ESP-SR WakeNet
 * WebSocket connection to the ZYRA server
 * Runtime detection of server disconnects
-* Automatic fallback to offline relay AP mode
+* Automatic fallback to offline relay modes
+* Offline voice command recognition using ESP-SR MultiNet
+* Offline speech prompt playback from SPIFFS
 * Offline relay-board HTTP communication
-* Offline speech connectivity support
-* SPIFFS asset usage for offline mode
 * INMP441 microphone input
 * MAX98357 speaker output
 * OLED display states
@@ -130,23 +169,61 @@ It handles:
 
 Important files:
 
-| File                         | Purpose                                                                                   |
-| ---------------------------- | ----------------------------------------------------------------------------------------- |
-| `main/main.c`                | Main ESP32-S3 firmware logic, online pipeline, Wi-Fi handling, and offline fallback entry |
-| `main/audio_pipeline.c`      | I2S microphone and speaker pipeline                                                       |
-| `main/audio_pipeline.h`      | Audio pipeline header                                                                     |
-| `main/websocket_client.c`    | ESP32 WebSocket client with disconnect callback and stop support                          |
-| `main/websocket_client.h`    | WebSocket client header                                                                   |
-| `main/offline_relay.c`       | Offline relay HTTP client and relay state sync logic                                      |
-| `main/offline_relay.h`       | Offline relay device/action definitions and API                                           |
-| `main/offline_speech.c`      | Firmware-side offline speech / limited command handling logic                             |
-| `main/offline_speech.h`      | Offline speech module API                                                                 |
-| `main/display.c`             | OLED display handling, including offline and relay status screens                         |
-| `main/display.h`             | Display state definitions                                                                 |
-| `main/zyra_config.example.h` | Safe example Wi-Fi, server, and offline relay configuration                               |
-| `spiffs/`                    | Offline speech / command assets used by firmware                                          |
-| `partitions.csv`             | ESP32 flash partition layout including storage space for assets                           |
-| `sdkconfig`                  | Working ESP-IDF project configuration                                                     |
+| File                         | Purpose                                                                                                  |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `main/main.c`                | Main ESP32-S3 firmware logic, online pipeline, Wi-Fi handling, wakeword flow, and offline fallback entry |
+| `main/audio_pipeline.c`      | I2S microphone and speaker pipeline                                                                      |
+| `main/audio_pipeline.h`      | Audio pipeline header                                                                                    |
+| `main/wakeword_engine.c`     | ESP-SR WakeNet wakeword engine for Jarvis detection                                                      |
+| `main/wakeword_engine.h`     | Wakeword engine API                                                                                      |
+| `main/offline_voice.c`       | ESP-SR MultiNet offline command recognizer                                                               |
+| `main/offline_voice.h`       | Offline voice command definitions and recognizer API                                                     |
+| `main/offline_speech.c`      | SPIFFS WAV prompt loader and offline prompt playback logic                                               |
+| `main/offline_speech.h`      | Offline speech prompt API                                                                                |
+| `main/offline_relay.c`       | Offline relay HTTP client, relay status sync, toggle, and group control logic                            |
+| `main/offline_relay.h`       | Offline relay device/action definitions and API                                                          |
+| `main/websocket_client.c`    | ESP32 WebSocket client with disconnect callback and stop support                                         |
+| `main/websocket_client.h`    | WebSocket client header                                                                                  |
+| `main/display.c`             | OLED display handling, including wakeword, offline, relay, and speaking states                           |
+| `main/display.h`             | Display state definitions                                                                                |
+| `main/zyra_config.example.h` | Safe example Wi-Fi, server, and offline relay configuration                                              |
+| `spiffs/`                    | Offline WAV prompts used by the firmware                                                                 |
+| `partitions.csv`             | ESP32 flash partition layout for app, ESP-SR model partition, and SPIFFS storage                         |
+| `sdkconfig`                  | Working ESP-IDF project configuration                                                                    |
+
+---
+
+## Wakeword Support
+
+ZYRA now includes hardware wakeword support on the ESP32-S3.
+
+The current wakeword is:
+
+```text
+Jarvis
+```
+
+Wakeword behavior:
+
+```text
+Idle
+→ Say "Jarvis"
+→ Wakeword detected
+→ Display switches to listening state
+→ ZYRA captures the command
+→ Audio is sent to the Python server when online
+→ Response is played through the speaker
+→ ZYRA returns to idle
+```
+
+The firmware uses ESP-SR WakeNet for wakeword detection. ESP-SR is enabled in the firmware component dependencies, and the project configuration enables the Jarvis WakeNet model.
+
+Important note:
+
+```text
+The wakeword is handled on the ESP32-S3.
+Full natural-language understanding still happens on the Python server when online.
+```
 
 ---
 
@@ -157,6 +234,7 @@ ZYRA can identify smart-home commands from natural speech and route them to the 
 Supported smart-home capabilities include:
 
 * Turning individual devices on or off
+* Toggling individual devices
 * Understanding device aliases
 * Handling grouped commands
 * Handling mixed commands
@@ -182,24 +260,24 @@ Supported smart-home groups:
 | Home theatre / Home theater / Full system | TV + Soundbar + Subwoofer + Rear speakers |
 | Surround system / Rear system             | Rear speakers                             |
 
-Example commands:
+Example online commands:
 
-```text id="z35yxr"
-Turn on my TV
-Switch off the soundbar
-Turn on the rear speakers
-Turn off the sound system
-Turn everything off
-Power on the home theatre
-Turn off the TV and turn on everything else
-Turn on everything except TV
-Which all devices are on?
+```text
+Jarvis, turn on my TV
+Jarvis, switch off the soundbar
+Jarvis, turn on the rear speakers
+Jarvis, turn off the sound system
+Jarvis, turn everything off
+Jarvis, power on the home theatre
+Jarvis, turn off the TV and turn on everything else
+Jarvis, turn on everything except TV
+Jarvis, which all devices are on?
 ```
 
-Typical smart-home flow:
+Typical online smart-home flow:
 
-```text id="o4hlxe"
-User voice
+```text
+Wakeword
 → ESP32-S3 microphone
 → ZYRA server
 → Speech-to-text
@@ -217,21 +295,21 @@ The relay-board firmware is not stored in this repository. It belongs in the sep
 
 ZYRA includes firmware-side offline relay connectivity.
 
-This mode is designed for situations where the ESP32-S3 cannot reach the ZYRA Python server or the WebSocket connection drops during runtime. When that happens, the firmware can stop the WebSocket client, switch from the normal home Wi-Fi connection to the ESP8266 relay board's direct AP, and communicate with the relay board locally through HTTP.
+This mode is designed for situations where the ESP32-S3 cannot reach the ZYRA Python server or the WebSocket connection drops during runtime. When that happens, the firmware can stop the WebSocket client and continue local relay control through the relay board.
 
 Offline relay connectivity focuses on:
 
 * Detecting WebSocket/server loss during online mode
 * Stopping the WebSocket client cleanly
-* Switching Wi-Fi from home network to relay-board AP
-* Using a static offline IP for more reliable relay AP communication
-* Fetching relay status through `/status`
+* Using relay-board HTTP endpoints directly
+* Switching to ESP-REMOTE-DIRECT AP when home Wi-Fi is unavailable
+* Using relay status from `/status`
 * Tracking relay states for TV, soundbar, subwoofer, and rear speakers
-* Showing offline/relay status on the OLED display
+* Showing offline and relay status on the OLED display
 
 Important note:
 
-```text id="cgv8ej"
+```text
 Offline relay connectivity does not mean the full AI assistant runs only on the ESP32-S3.
 
 The ZYRA Python server is still required for full speech-to-text, AI response generation, memory, and text-to-speech.
@@ -241,35 +319,94 @@ The offline relay firmware module provides local relay-board connectivity and re
 
 ---
 
-## Offline Speech Connectivity
+## Offline Voice Commands
 
-ZYRA now includes firmware-side offline speech connectivity support.
+ZYRA now includes firmware-side offline voice command recognition.
 
-This layer is meant to provide a limited local fallback path for relay-related commands when the full ZYRA server pipeline is unavailable. It works together with:
+This is a limited local fallback mode using ESP-SR MultiNet. It is meant for relay-control commands when the Python server is unavailable.
 
-* `offline_speech.c`
-* `offline_speech.h`
-* `offline_relay.c`
-* `offline_relay.h`
-* `zyra-firmware/spiffs/`
+Offline voice supports commands for:
 
-The goal of this mode is not to replace the full Python AI server. Instead, it provides a lightweight offline path for basic local control behavior.
+* TV on/off/toggle
+* Soundbar on/off/toggle
+* Subwoofer on/off/toggle
+* Rear speakers on/off/toggle
+* Sound system on/off
+* All speakers on/off
+* Home theater on/off
+* Device status
 
-Offline speech connectivity focuses on:
+Example offline commands:
 
-* Limited firmware-side command handling
-* Local relay-control fallback
-* SPIFFS-based offline assets
-* OLED feedback for offline status
-* Reduced dependency on the Python server for basic relay fallback behavior
+```text
+turn on my tv
+turn off tv
+toggle tv
+turn on soundbar
+turn off soundbar
+turn on subwoofer
+turn off subwoofer
+turn on rear speakers
+turn off rear speakers
+turn on sound system
+turn off sound system
+turn on all speakers
+turn off all speakers
+turn on home theater
+turn off home theater
+check status
+which devices are on
+```
 
 Current limitation:
 
-```text id="cprq84"
-Full offline AI conversation is not included yet.
+```text
+Offline voice mode is for limited relay-control commands only.
 
-Offline speech connectivity is only a fallback layer for limited local control behavior.
-Natural conversation, memory, full STT, LLM reasoning, and Piper TTS still require the ZYRA Python server.
+Full natural conversation, full STT, LLM reasoning, memory, and Piper TTS still require the ZYRA Python server.
+```
+
+---
+
+## Offline Speech Prompts
+
+The firmware uses SPIFFS WAV prompts for offline confirmations.
+
+Examples:
+
+```text
+tv_on.wav
+tv_off.wav
+soundbar_on.wav
+soundbar_off.wav
+subwoofer_on.wav
+subwoofer_off.wav
+rear_on.wav
+rear_off.wav
+sound_system_on.wav
+sound_system_off.wav
+all_speakers_on.wav
+all_speakers_off.wav
+home_theater_on.wav
+home_theater_off.wav
+status.wav
+done.wav
+failed.wav
+```
+
+The firmware also includes pre-generated status prompts:
+
+```text
+status_0000.wav
+status_0001.wav
+...
+status_1111.wav
+```
+
+These represent all possible relay status combinations for:
+
+```text
+TV, Soundbar, Subwoofer, Rear speakers
 ```
 
 ---
@@ -287,25 +424,25 @@ The firmware offline relay module uses these relay-board endpoints:
 
 Status endpoint:
 
-```text id="1tke2r"
+```text
 /status
 ```
 
 Expected status payload format:
 
-```text id="axzhgd"
+```text
 TV,SOUNDBAR,SUBWOOFER,REAR
 ```
 
 Example:
 
-```text id="l51wwt"
+```text
 1,0,1,0
 ```
 
 Meaning:
 
-```text id="lyp9rr"
+```text
 TV ON
 Soundbar OFF
 Subwoofer ON
@@ -330,37 +467,37 @@ Rear speakers OFF
 
 Go to the server folder:
 
-```powershell id="2e51a9"
+```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-server
 ```
 
 Create a virtual environment:
 
-```powershell id="34gkc1"
+```powershell
 py -3.11 -m venv .venv
 ```
 
 Activate it:
 
-```powershell id="aa955h"
+```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
 Upgrade pip tools:
 
-```powershell id="8a2y25"
+```powershell
 python -m pip install --upgrade pip setuptools wheel
 ```
 
 Install PyTorch CUDA:
 
-```powershell id="qsju0c"
+```powershell
 python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Install project dependencies:
 
-```powershell id="dg2h5b"
+```powershell
 python -m pip install -r requirements.txt
 python -m pip install piper-tts
 ```
@@ -373,7 +510,7 @@ The Piper `.onnx` voice model is not included in GitHub because it is a large fi
 
 Required local files:
 
-```text id="8fqmc4"
+```text
 zyra-server/models/en_US-lessac-high.onnx
 zyra-server/models/en_US-lessac-high.onnx.json
 ```
@@ -382,7 +519,7 @@ Only the `.json` config file is committed.
 
 Copy the `.onnx` model manually into:
 
-```text id="v0i2qx"
+```text
 zyra-server/models/
 ```
 
@@ -392,19 +529,19 @@ zyra-server/models/
 
 Copy:
 
-```text id="8uoway"
+```text
 zyra-server/.env.example
 ```
 
 to:
 
-```text id="tfz9v5"
+```text
 zyra-server/.env
 ```
 
 Example:
 
-```env id="etowq3"
+```env
 PYTHONIOENCODING=utf-8
 
 OLLAMA_URL=http://localhost:11434
@@ -425,7 +562,7 @@ Use the IP address of your Smart Extension relay board for `SMART_HOME_BASE_URLS
 
 Multiple relay-board URLs can be given as a comma-separated list:
 
-```env id="5evqgx"
+```env
 SMART_HOME_BASE_URLS=http://192.168.29.97,http://192.168.31.156
 ```
 
@@ -437,13 +574,13 @@ Do not commit `.env`.
 
 Start Ollama first:
 
-```powershell id="cq3wzm"
+```powershell
 ollama run llama3.2:3b-instruct-q4_0
 ```
 
 Then run the ZYRA server:
 
-```powershell id="zc5tna"
+```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-server
 .\.venv\Scripts\Activate.ps1
 python main.py
@@ -451,7 +588,7 @@ python main.py
 
 Expected output:
 
-```text id="przi0b"
+```text
 Whisper ready
 LLM loaded into GPU
 TTS engine ready
@@ -462,7 +599,7 @@ Uvicorn running on http://0.0.0.0:8765
 
 Health check:
 
-```text id="vqvzwv"
+```text
 http://localhost:8765/health
 ```
 
@@ -472,13 +609,13 @@ http://localhost:8765/health
 
 Run the main component test:
 
-```powershell id="r0lh72"
+```powershell
 python test_components.py
 ```
 
 Expected:
 
-```text id="o5sd5e"
+```text
 ✓ Ollama working
 ✓ Whisper working
 ✓ Piper TTS working
@@ -488,13 +625,13 @@ Expected:
 
 Test the WebSocket pipeline:
 
-```powershell id="jj89i1"
+```powershell
 python test_websocket.py --text "Turn on my TV"
 ```
 
 Interactive test mode:
 
-```powershell id="9ry437"
+```powershell
 python test_websocket.py --interactive
 ```
 
@@ -504,25 +641,25 @@ python test_websocket.py --interactive
 
 Go to the firmware folder:
 
-```powershell id="qfb1un"
+```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-firmware
 ```
 
 Set ESP32-S3 target:
 
-```powershell id="i2ylab"
+```powershell
 idf.py set-target esp32s3
 ```
 
 Create this private file:
 
-```text id="jtz1gr"
+```text
 zyra-firmware/main/zyra_config.h
 ```
 
 Add your Wi-Fi, server, and offline relay details:
 
-```c id="3tqrg1"
+```c
 #pragma once
 
 // ── Home Wi-Fi + ZYRA server ─────────────────────
@@ -537,37 +674,67 @@ Add your Wi-Fi, server, and offline relay details:
 #define RELAY_AP_SSID      "ESP-REMOTE-DIRECT"
 #define RELAY_AP_PASSWORD  "12345678"
 
+// ESP8266 home Wi-Fi IP.
+// This is used when Zyra is still connected to home Wi-Fi.
+#define RELAY_HOME_BASE_URL "http://192.168.29.97"
+
 // ESP8266 direct AP IP.
-#define RELAY_BASE_URL     "http://192.168.4.1"
+// This is used only when home Wi-Fi itself fails.
+#define RELAY_AP_BASE_URL   "http://192.168.4.1"
 ```
 
 Do not commit `zyra_config.h`.
 
 A safe template file is included as:
 
-```text id="ipct9g"
+```text
 zyra-firmware/main/zyra_config.example.h
 ```
 
 ---
 
+## ESP-SR Model Setup
+
+Wakeword and offline command recognition use ESP-SR models.
+
+The firmware configuration uses:
+
+```text
+Jarvis WakeNet
+English MultiNet
+ESP-SR model partition
+```
+
+The partition table includes a dedicated model partition and a SPIFFS storage partition:
+
+```text
+model
+storage
+```
+
+Make sure the ESP-SR model partition is generated and flashed during the firmware build process.
+
+---
+
 ## SPIFFS Asset Setup
 
-The firmware uses the `zyra-firmware/spiffs/` folder for offline mode assets.
+The firmware uses the `zyra-firmware/spiffs/` folder for offline WAV prompts.
 
-Make sure the required offline speech or command assets are placed inside:
+The SPIFFS image is generated from:
 
-```text id="vx6w2q"
+```text
 zyra-firmware/spiffs/
 ```
 
-The SPIFFS storage partition is configured through:
+and flashed into the `storage` partition.
 
-```text id="1ujza9"
-zyra-firmware/partitions.csv
+The component CMake configuration includes:
+
+```cmake
+spiffs_create_partition_image(storage ../spiffs FLASH_IN_PROJECT)
 ```
 
-Build output files such as `.bin`, `.elf`, and generated storage images should not be committed unless intentionally required. Source assets inside `spiffs/` can be committed if the firmware needs them at runtime.
+So a normal flash command should flash the SPIFFS image along with the firmware.
 
 ---
 
@@ -575,7 +742,7 @@ Build output files such as `.bin`, `.elf`, and generated storage images should n
 
 Run:
 
-```powershell id="r2t5ds"
+```powershell
 ipconfig
 ```
 
@@ -583,7 +750,7 @@ Use the IPv4 address under your Wi-Fi adapter.
 
 Example:
 
-```text id="xc30xf"
+```text
 192.168.29.77
 ```
 
@@ -595,7 +762,7 @@ This IP should be used as `SERVER_IP` in `zyra_config.h`.
 
 Run PowerShell as Administrator:
 
-```powershell id="nvup0h"
+```powershell
 New-NetFirewallRule -DisplayName "ZYRA Server 8765" -Direction Inbound -Protocol TCP -LocalPort 8765 -Action Allow
 ```
 
@@ -603,7 +770,7 @@ New-NetFirewallRule -DisplayName "ZYRA Server 8765" -Direction Inbound -Protocol
 
 ## Build and Flash Firmware
 
-```powershell id="1k644l"
+```powershell
 cd C:\Users\abhia\Documents\ZYRA\zyra-firmware
 idf.py build
 idf.py -p COM11 flash monitor
@@ -613,34 +780,34 @@ Replace `COM11` with your actual ESP32-S3 port.
 
 Expected online firmware output:
 
-```text id="tlmlwu"
+```text
 WiFi connected
 Mic initialized on I2S port 1
 Amp initialized on I2S port 0
+Wakeword engine ready
+Say Jarvis
 Connected to ZYRA server
-ZYRA ready — listening for speech
-Capture buffer allocated successfully
 ZYRA online
 ```
 
-Expected server output:
+Expected wakeword flow:
 
-```text id="ycz9ey"
-WebSocket /zyra [accepted]
-Client connected
-connection open
+```text
+Wakeword detected
+Listening
+Sending audio to server
+Playing response
+Returning to idle
 ```
 
 Expected offline fallback output when the server is unavailable:
 
-```text id="xef6rm"
+```text
 Server connection failed
 Entering offline relay mode
-Switching to offline relay AP
-Connected to offline relay AP
-Offline relay module ready
+Offline speech ready
+Offline voice recognizer started
 Offline relay status synced
-ZYRA offline relay mode active
 ```
 
 ---
@@ -682,7 +849,7 @@ ZYRA offline relay mode active
 
 Do not commit:
 
-```text id="vg2j99"
+```text
 zyra-server/.venv/
 zyra-server/.env
 zyra-server/memory/
@@ -694,7 +861,7 @@ zyra-repomix-output.xml
 
 Safe to commit:
 
-```text id="s0bdt7"
+```text
 zyra-server/.env.example
 zyra-server/models/en_US-lessac-high.onnx.json
 zyra-firmware/main/zyra_config.example.h
@@ -702,13 +869,36 @@ zyra-firmware/sdkconfig
 zyra-firmware/spiffs/
 ```
 
-Only commit `zyra-firmware/spiffs/` if it contains required source assets for offline mode. Do not commit generated binary build outputs.
+Only commit `zyra-firmware/spiffs/` when it contains required source WAV prompts for offline mode. Do not commit generated `.bin`, `.elf`, `.map`, or build output files.
 
 The Smart Extension relay-board firmware should be committed in its own separate repository.
 
 ---
 
 ## Troubleshooting
+
+### Wakeword is not detected
+
+Check:
+
+* ESP-SR dependency is enabled in `idf_component.yml`
+* `sdkconfig` has Jarvis WakeNet enabled
+* ESP-SR model partition is flashed
+* Microphone pins match `audio_pipeline.c`
+* INMP441 is powered from 3.3V
+* Serial monitor shows the wakeword engine initialized
+* Room noise is not too high
+* Speak clearly near the microphone
+
+### Build fails after enabling wakeword
+
+Check:
+
+* `esp-sr` is listed in `idf_component.yml`
+* `esp-sr` is listed under `REQUIRES` in `main/CMakeLists.txt`
+* `wakeword_engine.c` is included under `SRCS`
+* ESP-IDF Component Manager has downloaded ESP-SR
+* `idf.py reconfigure` was run after dependency changes
 
 ### ESP32 connects to Wi-Fi but not server
 
@@ -738,27 +928,38 @@ Check:
 * ESP8266 relay board direct AP is enabled
 * `RELAY_AP_SSID` matches the ESP8266 AP name
 * `RELAY_AP_PASSWORD` is correct
-* `RELAY_BASE_URL` is correct
+* `RELAY_HOME_BASE_URL` and `RELAY_AP_BASE_URL` are correct
 * ESP8266 direct AP IP is reachable
 * `/status` works at the relay base URL
 * Router/client isolation is not involved when using normal LAN mode
 
-### Offline speech connectivity is not working
+### Offline voice command is not working
 
 Check:
 
-* `offline_speech.c` and `offline_speech.h` are included in the firmware build
-* `zyra-firmware/main/CMakeLists.txt` includes the offline speech source file
-* Required assets exist inside `zyra-firmware/spiffs/`
-* `partitions.csv` has enough storage space for SPIFFS assets
-* The SPIFFS image is being generated and flashed correctly
-* Offline relay mode is successfully connecting to the relay-board AP
+* ESP-SR MultiNet English model is enabled
+* `offline_voice.c` is included in the firmware build
+* Microphone input level is high enough
+* Command phrases are registered in serial monitor
+* Probability threshold is not too strict
+* Offline relay mode is active
+
+### Offline speech prompt is not playing
+
+Check:
+
+* `offline_speech.c` is included in the firmware build
+* SPIFFS is mounted successfully
+* Required `.wav` files exist inside `zyra-firmware/spiffs/`
+* WAV files are mono 16-bit PCM
+* SPIFFS image is flashed into the `storage` partition
+* MAX98357 pins match `audio_pipeline.c`
 
 ### Piper model not found
 
 Make sure this file exists:
 
-```text id="lccl8y"
+```text
 zyra-server/models/en_US-lessac-high.onnx
 ```
 
@@ -768,7 +969,7 @@ Enable PSRAM in ESP-IDF menuconfig.
 
 Expected healthy log:
 
-```text id="awfzuj"
+```text
 Free PSRAM before alloc: ...
 Capture buffer allocated successfully
 ```
@@ -777,7 +978,7 @@ Capture buffer allocated successfully
 
 Check OLED pins in `display.c`:
 
-```c id="746pah"
+```c
 #define OLED_SDA 15
 #define OLED_SCL 16
 ```
@@ -800,20 +1001,32 @@ Completed:
 * Local relay-board command forwarding from the server
 * ESP32-S3 Wi-Fi connection
 * ESP32-S3 WebSocket connection
+* Jarvis wakeword support using ESP-SR WakeNet
+* ESP-SR MultiNet offline command recognizer
 * WebSocket disconnect callback support
 * Runtime fallback trigger when server connection is lost
 * I2S mic initialization
 * I2S amplifier initialization
 * PSRAM audio buffer allocation
-* Firmware-side offline relay AP connectivity
+* Firmware-side offline relay connectivity
 * Firmware-side offline relay status sync
-* Firmware-side offline speech connectivity support
+* Firmware-side offline speech prompt playback
 * SPIFFS asset support for offline mode
-* OLED states for offline relay mode
+* OLED states for wakeword and offline relay mode
 
 Not included yet:
 
-* Full offline AI execution without the ZYRA server
+* Full offline AI conversation without the ZYRA server
 * Full natural conversation directly on the ESP32-S3
-* Wake word refinement
+* Final UI appearance upgrade
 * Smart Extension relay-board firmware inside this repository
+
+Next:
+
+* Commit wakeword firmware milestone
+* End-to-end Jarvis wakeword testing
+* End-to-end smart-home voice testing
+* Offline relay command execution testing
+* Offline voice command testing
+* OLED/UI appearance upgrade
+* Separate Smart Extension / Smart-Switch-Board repository cleanup
