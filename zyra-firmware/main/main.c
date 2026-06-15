@@ -15,6 +15,7 @@
 #include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 
 // ESP-SR
 #include "offline_voice.h"
@@ -26,6 +27,7 @@
 #include "websocket_client.h"
 #include "display.h"
 #include "offline_relay.h"
+#include "status_led.h"
 
 #define CAPTURE_SAMPLE_RATE 16000
 
@@ -45,6 +47,10 @@ static esp_netif_t* s_sta_netif = NULL;
 #define OFFLINE_AP_CONNECT_TIMEOUT_MS   12000
 #define OFFLINE_AP_RETRY_DELAY_MS       1200
 
+#define SERVER_HEALTH_INTERVAL_MS   5000
+#define SERVER_HEALTH_TIMEOUT_MS    1500
+#define SERVER_HEALTH_FAIL_LIMIT    2
+
 static volatile bool s_switching_wifi = false;
 
 // This means: server is unavailable, so online voice mode pauses.
@@ -58,6 +64,10 @@ static volatile bool s_relay_ap_mode = false;
 
 static volatile bool s_force_runtime_fallback = false;
 static volatile bool s_force_direct_ap_fallback = false;
+static volatile bool s_relay_error_active = false;
+static volatile bool s_online_voice_paused = false;
+static int s_relay_fail_count = 0;
+static int s_relay_ok_count = 0;
 
 static TaskHandle_t s_runtime_fallback_task_handle = NULL;
 static TaskHandle_t s_server_reconnect_task_handle = NULL;
@@ -69,9 +79,26 @@ static void zyra_task(void* param);
 static bool start_offline_mode(const char* reason);
 static bool start_home_relay_mode(const char* reason);
 static void request_direct_ap_fallback(const char* reason);
+static void handle_offline_voice_ui(OfflineVoiceUiEvent event);
+static void handle_offline_voice_command(
+    OfflineVoiceCommand command,
+    const char* phrase,
+    float probability
+);
+
+static bool online_wake_should_abort(void) {
+    return s_online_voice_paused ||
+           s_offline_mode ||
+           s_switching_wifi;
+}
+
+static void show_transition_state(DisplayState state, uint32_t duration_ms);
 
 static void set_state(DisplayState state);
 static void drain_mic_frames(int frames);
+
+static void server_health_task(void* arg);
+static bool server_health_check_http(void);
 
 static const char* offline_command_label(OfflineVoiceCommand command) {
     switch (command) {
@@ -180,15 +207,8 @@ static const char* offline_status_prompt_filename(void) {
 }
 
 static void play_offline_response(OfflineVoiceCommand command, bool ok) {
-    /*
-    set_state(DISP_SPEAKING); // DISP_SPEAKING disabled.
-       
-       Offline voice response should play in the background while the OLED
-       keeps showing the useful result screen:
-       - COMMAND DONE
-       - COMMAND FAILED
-       - OFFLINE STATUS
-    */
+
+    status_led_set_state(STATUS_LED_SPEAKING);
 
     if (!ok) {
         if (offline_speech_play("failed.wav") != ESP_OK) {
@@ -212,18 +232,80 @@ static void play_offline_response(OfflineVoiceCommand command, bool ok) {
     drain_mic_frames(35);
 }
 
-static void handle_offline_voice_command(
-    OfflineVoiceCommand command,
-    const char* phrase,
-    float probability
-);
 
 // ── System state ──────────────────────────────────
 static volatile DisplayState g_state = DISP_BOOTING;
 
 static void set_state(DisplayState state) {
     g_state = state;
+
     display_set_state(state);
+
+    switch (state) {
+        case DISP_IDLE:
+            status_led_set_state(STATUS_LED_IDLE);
+            break;
+
+        case DISP_WAKE_DETECTED:
+        case DISP_LISTENING:
+        case DISP_HEARING:
+            // Solid current mode colour:
+            // online blue, serverless purple, offline orange
+            status_led_set_state(STATUS_LED_MODE_SOLID);
+            break;
+
+        case DISP_PROCESSING:
+            // Breathing current mode colour
+            status_led_set_state(STATUS_LED_MODE_BREATHING);
+            break;
+
+        case DISP_SPEAKING:
+            // Universal speaking green
+            status_led_set_state(STATUS_LED_SPEAKING);
+            break;
+
+        case DISP_RELAY_OK:
+        case DISP_RELAY_RESTORED:
+            // Universal success green
+            status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
+            break;
+
+        case DISP_ONLINE_RESTORED:
+            // Server restored = solid online blue
+            status_led_set_state(STATUS_LED_MODE_SOLID);
+            break;
+
+        case DISP_RELAY_FAIL:
+            // Command failed = solid red
+            status_led_set_state(STATUS_LED_COMMAND_FAILED);
+            break;
+
+        case DISP_ERROR:
+            // System/connection failure = blinking red
+            status_led_set_state(STATUS_LED_CONNECTION_FAILED);
+            break;
+
+        case DISP_SERVERLESS:
+        case DISP_OFFLINE:
+            // Mode notification = solid current mode colour
+            status_led_set_state(STATUS_LED_MODE_SOLID);
+            break;
+
+        case DISP_CUSTOM:
+            break;
+
+        case DISP_BOOTING:
+        case DISP_CONNECTING:
+        default:
+            status_led_set_state(STATUS_LED_IDLE);
+            break;
+    }
+}
+
+static void show_transition_state(DisplayState state, uint32_t duration_ms) {
+    set_state(state);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    set_state(DISP_IDLE);
 }
 
 static void drain_mic_frames(int frames) {
@@ -247,30 +329,6 @@ static int32_t calculate_rms(const int16_t* frame, int count) {
     return (int32_t)sqrtf((float)sum_sq / count);
 }
 
-static void wait_for_quiet(int quiet_frames_required,
-                           int32_t quiet_threshold) {
-    int16_t frame[256];
-    int quiet_frames = 0;
-
-    while (quiet_frames < quiet_frames_required) {
-        int count = audio_read_wakenet_frame(frame, 256);
-
-        if (count <= 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        int32_t rms = calculate_rms(frame, count);
-
-        if (rms < quiet_threshold) {
-            quiet_frames++;
-        } else {
-            quiet_frames = 0;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
 
 // ── WiFi event handler ────────────────────────────
 static void wifi_event_handler(void* arg,
@@ -421,18 +479,16 @@ static void configure_offline_static_ip(void) {
     err = esp_netif_set_ip_info(s_sta_netif, &ip_info);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set offline static IP: %s",
+        ESP_LOGE(TAG, "Failed to set serverless static IP: %s",
                  esp_err_to_name(err));
         return;
     }
 
-    ESP_LOGI(TAG, "Offline static IP configured: 192.168.4.50");
+    ESP_LOGI(TAG, "Serverless static IP configured: 192.168.4.50");
 }
 
 static bool wifi_connect_offline_relay_ap(void) {
     ESP_LOGW(TAG, "Switching to offline relay AP");
-
-    set_state(DISP_OFFLINE);
 
     s_switching_wifi = true;
     s_offline_mode   = true;
@@ -565,11 +621,16 @@ static bool wifi_connect_offline_relay_ap(void) {
     s_switching_wifi = false;
 
     ESP_LOGE(TAG, "Offline relay AP connection failed after retries");
-    set_state(DISP_RELAY_FAIL);
+    set_state(DISP_ERROR);
     return false;
 }
 
 static void request_runtime_offline_fallback(bool force) {
+
+    // Stop online voice path immediately.
+    s_online_voice_paused = true;
+    set_state(DISP_IDLE);
+
     if (s_offline_mode || s_switching_wifi) {
         return;
     }
@@ -583,6 +644,100 @@ static void request_runtime_offline_fallback(bool force) {
 
     if (s_runtime_fallback_task_handle) {
         xTaskNotifyGive(s_runtime_fallback_task_handle);
+    }
+}
+
+static bool server_health_check_http(void) {
+    char url[96];
+
+    snprintf(
+        url,
+        sizeof(url),
+        "http://%s:%d/health",
+        SERVER_IP,
+        SERVER_PORT
+    );
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = SERVER_HEALTH_TIMEOUT_MS,
+    };
+
+    esp_http_client_handle_t client =
+        esp_http_client_init(&config);
+
+    if (!client) {
+        ESP_LOGE(TAG, "Server health client init failed");
+        return false;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Server health failed: %s",
+            esp_err_to_name(err)
+        );
+
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+
+    esp_http_client_cleanup(client);
+
+    if (status != 200) {
+        ESP_LOGW(TAG, "Server health HTTP status: %d", status);
+        return false;
+    }
+
+    return true;
+}
+
+static void server_health_task(void* arg) {
+    int fail_count = 0;
+
+    ESP_LOGI(TAG, "Server health task started");
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(SERVER_HEALTH_INTERVAL_MS));
+
+        // Health monitor is only for online mode.
+        if (s_offline_mode || s_switching_wifi) {
+            fail_count = 0;
+            continue;
+        }
+
+        bool ok = server_health_check_http();
+
+        if (ok) {
+            if (fail_count > 0) {
+                ESP_LOGI(TAG, "Server health restored while online");
+            }
+
+            fail_count = 0;
+            continue;
+        }
+
+        fail_count++;
+
+        ESP_LOGW(
+            TAG,
+            "Server health failed %d/%d",
+            fail_count,
+            SERVER_HEALTH_FAIL_LIMIT
+        );
+
+        if (fail_count >= SERVER_HEALTH_FAIL_LIMIT) {
+            fail_count = 0;
+
+            ESP_LOGE(TAG, "Server health monitor triggered fallback");
+
+            // Force = do not wait for WebSocket disconnect grace period.
+            request_runtime_offline_fallback(true);
+        }
     }
 }
 
@@ -604,11 +759,13 @@ static void websocket_lost_callback(void) {
     request_runtime_offline_fallback(false);
 }
 
+
 static void handle_offline_voice_command(
     OfflineVoiceCommand command,
     const char* phrase,
     float probability
-) {
+) { 
+    
     if (!s_offline_mode || s_switching_wifi) {
         ESP_LOGW(TAG, "Ignoring offline voice command outside offline mode");
         return;
@@ -765,14 +922,12 @@ static void handle_offline_voice_command(
 
     if (s_offline_mode) {
         if (command == OFFLINE_VOICE_CMD_STATUS && ok) {
-            // Keep the status screen visible briefly after reading it aloud.
-            vTaskDelay(pdMS_TO_TICKS(4000));
-            set_state(DISP_OFFLINE);
+            vTaskDelay(pdMS_TO_TICKS(2500));
         } else {
-            // Normal command result screen stays briefly, then returns to offline idle.
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            set_state(DISP_OFFLINE);
+            vTaskDelay(pdMS_TO_TICKS(800));
         }
+
+        set_state(DISP_IDLE);
     }
 
 }
@@ -785,22 +940,38 @@ static bool start_offline_mode(const char* reason) {
 
     ESP_LOGW(TAG, "Entering direct AP offline relay mode: %s", reason);
 
+    // Direct offline AP mode owns the mic.
     s_offline_mode = true;
     s_home_relay_mode = false;
     s_relay_ap_mode = true;
-
-    set_state(DISP_OFFLINE);
+    s_online_voice_paused = true;
 
     ws_client_stop();
 
     offline_relay_set_base_url(RELAY_AP_BASE_URL);
 
+    // First connect to ESP8266 direct AP.
+    // Do not start offline voice while Wi-Fi is switching.
     if (!wifi_connect_offline_relay_ap()) {
         ESP_LOGE(TAG, "Failed to enter direct AP offline relay mode");
+
         s_relay_ap_mode = false;
-        set_state(DISP_RELAY_FAIL);
+        s_offline_mode = false;
+
+        // Connection failed = blinking red
+        set_state(DISP_ERROR);
         return false;
     }
+
+    // Set offline colour before showing notification.
+    status_led_set_mode(STATUS_LED_MODE_OFFLINE);
+
+    // Show OFFLINE / RELAY MODE once.
+    show_transition_state(DISP_OFFLINE, 1400);
+
+    // Give I2S/mic a small settling gap after Wi-Fi switching.
+    drain_mic_frames(12);
+    vTaskDelay(pdMS_TO_TICKS(300));
 
     if (s_offline_relay_task_handle == NULL) {
         xTaskCreatePinnedToCore(
@@ -814,9 +985,9 @@ static bool start_offline_mode(const char* reason) {
         );
     }
 
+    // Start offline voice only after AP switch + notification + mic drain.
+    offline_voice_set_ui_callback(handle_offline_voice_ui);
     offline_voice_start(handle_offline_voice_command);
-
-    set_state(DISP_OFFLINE);
 
     ESP_LOGI(TAG, "ZYRA switched to direct AP offline relay mode");
     return true;
@@ -828,13 +999,12 @@ static bool start_home_relay_mode(const char* reason) {
         return true;
     }
 
-    ESP_LOGW(TAG, "Entering home relay offline mode: %s", reason);
+    ESP_LOGW(TAG, "Entering serverless mode: %s", reason);
 
     s_offline_mode = true;
     s_home_relay_mode = true;
     s_relay_ap_mode = false;
-
-    set_state(DISP_OFFLINE);
+    s_online_voice_paused = true;
 
     // Stop WebSocket only. Do NOT disconnect home Wi-Fi.
     ws_client_stop();
@@ -844,13 +1014,18 @@ static bool start_home_relay_mode(const char* reason) {
 
     // Confirm ESP8266 is reachable on home Wi-Fi.
     if (!offline_relay_fetch_status()) {
-        ESP_LOGW(TAG, "Home relay IP not reachable. Falling back to direct AP mode.");
+        ESP_LOGW(TAG, "Home relay IP not reachable. Falling back to offline mode.");
 
         s_home_relay_mode = false;
         s_offline_mode = false;
 
         return start_offline_mode("home relay unavailable");
     }
+
+    // Current mode colour = purple.
+    status_led_set_mode(STATUS_LED_MODE_SERVERLESS);
+    // Show SERVERLESS / LOCAL MODE before starting offline voice then idle.
+    show_transition_state(DISP_SERVERLESS, 2200);
 
     if (s_offline_relay_task_handle == NULL) {
         xTaskCreatePinnedToCore(
@@ -864,11 +1039,10 @@ static bool start_home_relay_mode(const char* reason) {
         );
     }
 
+    offline_voice_set_ui_callback(handle_offline_voice_ui);
     offline_voice_start(handle_offline_voice_command);
 
-    set_state(DISP_OFFLINE);
-
-    ESP_LOGI(TAG, "ZYRA switched to home relay offline mode");
+    ESP_LOGI(TAG, "ZYRA switched to serverless mode");
     return true;
 }
 
@@ -883,7 +1057,7 @@ static void runtime_fallback_task(void* arg) {
         if (s_force_direct_ap_fallback) {
             s_force_direct_ap_fallback = false;
 
-            ESP_LOGE(TAG, "Home WiFi unavailable, switching to direct AP relay mode");
+            ESP_LOGE(TAG, "Home WiFi unavailable, switching to offline mode");
 
             // Clear home relay state before switching to direct AP.
             s_offline_mode = false;
@@ -932,7 +1106,9 @@ static void runtime_fallback_task(void* arg) {
 
         ESP_LOGE(TAG, "%s", log_reason);
 
-        start_home_relay_mode(offline_reason);
+        if (!start_home_relay_mode(offline_reason)) {
+            start_offline_mode(offline_reason);
+        }
     }
 }
 
@@ -965,14 +1141,26 @@ static void server_reconnect_task(void* arg) {
 
         ESP_LOGI(TAG, "Server restored. Switching back to online mode.");
 
+        s_online_voice_paused = true;
+
         offline_voice_stop();
 
         vTaskDelay(pdMS_TO_TICKS(500));
 
+        // Server restored.
+        // Current mode colour = blue again.
+        status_led_set_mode(STATUS_LED_MODE_ONLINE);
+
+        // Show ONLINE / SERVER BACK while online task is still blocked.
+        show_transition_state(DISP_ONLINE_RESTORED, 2500);
+
+        // Now release online mode after the user has seen the notification.
         s_offline_mode = false;
         s_home_relay_mode = false;
         s_relay_ap_mode = false;
         s_force_runtime_fallback = false;
+        s_force_direct_ap_fallback = false;
+        s_online_voice_paused = false;
 
         set_state(DISP_IDLE);
 
@@ -1013,16 +1201,15 @@ static void zyra_task(void* param) {
 
     // ── VAD settings ──────────────────────────────
     // Frame = 256 samples @ 16kHz = 16ms per frame
-    #define VAD_SPEECH_THRESHOLD       800  // must exceed to count as speech
+    #define VAD_SPEECH_THRESHOLD       1400  // must exceed to count as speech
     #define VAD_SILENCE_THRESHOLD      1200  // below this = silence
-    #define VAD_TRIGGER_FRAMES            7  // ~160ms continuous speech to trigger
+    #define VAD_TRIGGER_FRAMES            5  // ~160ms continuous speech to trigger
     #define VAD_SPEECH_FRAMES_MIN        12  // ~400ms real speech required
     #define VAD_SILENCE_FRAMES_END       85  // ~1.36s silence needed before ending capture
     #define VAD_MAX_CAPTURE_MS         6000  // keep 6s for longer questions
-    #define VAD_MIN_CAPTURE_BYTES      8000  // 0.5 sec at 16kHz 16-bit
-    #define VAD_QUIET_FRAMES_START       25  // wait for quiet before listening
+    #define VAD_MIN_CAPTURE_BYTES      8000  // 0.5 sec at 16kHz 16-bit 
     #define VAD_POST_SPEAK_COOLDOWN_MS  900  // prevent self-trigger after speaking
-    #define VAD_WAKE_COMMAND_TIMEOUT_MS 4500  // max time to wait for command after wake word
+    #define VAD_WAKE_COMMAND_TIMEOUT_MS 6500  // max time to wait for command after wake word
 
     size_t max_capture = (CAPTURE_SAMPLE_RATE * 2 * VAD_MAX_CAPTURE_MS) / 1000;
 
@@ -1047,13 +1234,13 @@ static void zyra_task(void* param) {
         return;
     }
 
-ESP_LOGI(TAG, "Capture buffer allocated successfully");
+    ESP_LOGI(TAG, "Capture buffer allocated successfully");
     int16_t frame[256];
 
     while (true) {
 
-        if (s_offline_mode) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+            vTaskDelay(pdMS_TO_TICKS(250));
             continue;
         }
 
@@ -1066,8 +1253,15 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
         // ── PHASE 0: Wait for wake word ───────────────────
         set_state(DISP_IDLE);
 
-        if (!wakeword_wait_blocking()) {
+        if (!wakeword_wait_blocking_abortable(online_wake_should_abort)) {
+            if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+                set_state(DISP_IDLE);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+
             set_state(DISP_ERROR);
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
@@ -1077,14 +1271,29 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
         vTaskDelay(pdMS_TO_TICKS(250));
         drain_mic_frames(8);
 
-        // ── PHASE 1: Wait for quiet, then capture command ─
-        wait_for_quiet(VAD_QUIET_FRAMES_START, VAD_SILENCE_THRESHOLD);
+        // If fallback started just after wakeword,
+        // stop online command capture immediately.
+        if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+            set_state(DISP_IDLE);
+            continue;
+        }
+
+        // ── PHASE 1: Wait for speech immediately ─
+        // Small circle means Zyra is ready and actually checking mic frames.
+        set_state(DISP_WAKE_DETECTED);
 
         int pre_speech_frames = 0;
         bool speech_detected = false;
         TickType_t speech_wait_start = xTaskGetTickCount();
 
         while (true) {
+
+            if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+                set_state(DISP_IDLE);
+                speech_detected = false;
+                break;
+            }
+
             uint32_t elapsed_ms =
                 (xTaskGetTickCount() - speech_wait_start) * portTICK_PERIOD_MS;
 
@@ -1121,7 +1330,8 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
         }
 
         // ── PHASE 2: Capture utterance ─────────────
-        set_state(DISP_LISTENING);
+        // Big moving circle only starts after real speech is detected.
+        set_state(DISP_HEARING);
 
         size_t captured    = 0;
         int silence_frames = 0;
@@ -1136,6 +1346,12 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
         TickType_t capture_start = xTaskGetTickCount();
 
         while (captured < max_capture) {
+
+            if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+                set_state(DISP_IDLE);
+                captured = 0;
+                break;
+            }
 
             // Hard time cap — never exceed VAD_MAX_CAPTURE_MS
             uint32_t elapsed_ms = (xTaskGetTickCount() - capture_start)
@@ -1178,6 +1394,11 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
             // No delay here — read as fast as I2S provides frames
         }
 
+        if (s_online_voice_paused || s_offline_mode || s_switching_wifi) {
+            set_state(DISP_IDLE);
+            continue;
+        }
+
         // Reject if not enough real speech
         if (speech_frames < VAD_SPEECH_FRAMES_MIN ||
             captured < VAD_MIN_CAPTURE_BYTES) {
@@ -1203,50 +1424,98 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
             continue;
         }
 
-        // ── PHASE 4: Wait for response ─────────────
-        int timeout = 0;
-        while (!ws_response_ready() && timeout < 300) {
-            if (!ws_is_connected()) {
-                ESP_LOGE(TAG, "Server disconnected while waiting for response");
-                request_runtime_offline_fallback(true);
+        // ── PHASE 4 + 5: Streamed response playback ───────
+        // Server may send one audio chunk or many chunks.
+        // Each chunk is played, then ESP32 sends an ACK so the
+        // server can safely send the next chunk.
+
+        bool response_stream_done = false;
+
+        while (!response_stream_done) {
+            int timeout = 0;
+
+            while (!ws_response_ready() && timeout < 1200) {
+                if (!ws_is_connected()) {
+                    ESP_LOGE(TAG, "Server disconnected while waiting for response");
+                    request_runtime_offline_fallback(true);
+                    break;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(100));
+                timeout++;
+            }
+
+            if (!ws_response_ready()) {
+                ESP_LOGW(TAG, "Response chunk timeout");
+
+                if (!ws_is_connected()) {
+                    set_state(DISP_OFFLINE);
+                } else {
+                    set_state(DISP_IDLE);
+                }
+
                 break;
             }
 
-            vTaskDelay(pdMS_TO_TICKS(100));
-            timeout++;
-        }
+            set_state(DISP_SPEAKING);
 
-        if (!ws_response_ready()) {
-            ESP_LOGW(TAG, "Response timeout");
+            uint8_t* audio_data = NULL;
+            int      sr         = 22050;
+            size_t   audio_len  = ws_get_response(&audio_data, &sr);
+            bool     final_part = ws_response_final();
 
-            if (!ws_is_connected()) {
-                set_state(DISP_OFFLINE);
-            } else {
-                set_state(DISP_IDLE);
+            uint8_t* play_copy = NULL;
+            size_t   play_len  = 0;
+            int      play_sr   = sr;
+
+            if (audio_data && audio_len > 0) {
+                play_copy = malloc(audio_len);
+
+                if (play_copy) {
+                    memcpy(play_copy, audio_data, audio_len);
+                    play_len = audio_len;
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate playback copy");
+                }
             }
 
-            continue;
+            // Free websocket response buffer BEFORE playback.
+            // This allows the websocket client to receive the next chunk
+            // while the current chunk is still playing.
+            ws_free_response();
+
+            // Tell server this chunk is safely copied.
+            // Server can now send the next chunk while we play this one.
+            ws_send_status("audio_chunk_buffered");
+
+            if (play_copy && play_len > 0) {
+                ESP_LOGI(
+                    TAG,
+                    "Playing buffered response chunk: %zu bytes at %dHz final=%d",
+                    play_len,
+                    play_sr,
+                    final_part ? 1 : 0
+                );
+
+                audio_play_response(play_copy, play_len, play_sr);
+                free(play_copy);
+            } else {
+                ESP_LOGI(TAG, "Empty response chunk");
+            }
+
+            if (final_part) {
+                response_stream_done = true;
+            } else {
+                set_state(DISP_PROCESSING);
+            }
         }
-        // ── PHASE 5: Play response ─────────────────
-        set_state(DISP_SPEAKING);
-        uint8_t* audio_data = NULL;
-        int      sr         = 22050;
-        size_t   audio_len  = ws_get_response(&audio_data, &sr);
 
-        if (audio_data && audio_len > 0) {
-            ESP_LOGI(TAG, "Playing %zu bytes at %dHz", audio_len, sr);
-            audio_play_response(audio_data, audio_len, sr);
+        // Give speaker output time to settle before listening again.
+        vTaskDelay(pdMS_TO_TICKS(VAD_POST_SPEAK_COOLDOWN_MS));
 
-            // Give speaker output time to settle before listening again.
-            vTaskDelay(pdMS_TO_TICKS(VAD_POST_SPEAK_COOLDOWN_MS));
+        // Clear leftover mic/I2S frames so Zyra does not hear itself.
+        drain_mic_frames(8);
 
-            // Clear leftover mic/I2S frames so Zyra does not hear itself.
-            drain_mic_frames(8);
-        } else {
-            ESP_LOGI(TAG, "No audio response — returning to idle");
-        }
-
-        ws_free_response();
         set_state(DISP_IDLE);
 
     }
@@ -1255,27 +1524,67 @@ ESP_LOGI(TAG, "Capture buffer allocated successfully");
     vTaskDelete(NULL);
 }   
 
+static void handle_offline_voice_ui(
+    OfflineVoiceUiEvent event
+) {
+    switch (event) {
+        case OFFLINE_VOICE_UI_IDLE:
+            set_state(DISP_IDLE);
+            break;
+
+        case OFFLINE_VOICE_UI_LISTENING:
+            set_state(DISP_LISTENING);
+            break;
+
+        case OFFLINE_VOICE_UI_HEARING:
+            set_state(DISP_HEARING);
+            break;
+
+        case OFFLINE_VOICE_UI_THINKING:
+            set_state(DISP_PROCESSING);
+            break;
+
+        case OFFLINE_VOICE_UI_SPEAKING:
+            // Offline speaking should only affect LED, not OLED.
+            status_led_set_state(STATUS_LED_SPEAKING);
+            break;
+
+        case OFFLINE_VOICE_UI_ERROR:
+            set_state(DISP_ERROR);
+            break;
+
+        default:
+            set_state(DISP_IDLE);
+            break;
+    }
+}
+
 static void offline_relay_task(void* param) {
     ESP_LOGI(TAG, "Offline relay task started");
-
-    set_state(DISP_OFFLINE);
 
     offline_relay_init();
 
     if (offline_relay_fetch_status()) {
         ESP_LOGI(TAG, "Offline relay status synced");
-        set_state(DISP_RELAY_OK);
-        vTaskDelay(pdMS_TO_TICKS(1200));
-        set_state(DISP_OFFLINE);
+
+        s_relay_error_active = false;
+        s_relay_fail_count = 0;
+        s_relay_ok_count = 0;
     } else {
         ESP_LOGE(TAG, "Offline relay status sync failed");
-        set_state(DISP_RELAY_FAIL);
+
+        // Connection failed = blinking red
+        s_relay_error_active = true;
+        s_relay_fail_count = 2;
+        s_relay_ok_count = 0;
+
+        set_state(DISP_ERROR);
     }
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
 
-         if (s_switching_wifi) {
+        if (s_switching_wifi) {
             continue;
         }
 
@@ -1286,11 +1595,41 @@ static void offline_relay_task(void* param) {
             return;
         }
 
-        if (offline_relay_fetch_status()) {
-            ESP_LOGI(TAG, "Offline relay live");
+        bool relay_ok = offline_relay_fetch_status();
+
+        if (!relay_ok) {
+            s_relay_ok_count = 0;
+            s_relay_fail_count++;
+
+            ESP_LOGW(TAG, "Relay health failed %d/2", s_relay_fail_count);
+
+            if (s_relay_fail_count >= 2 && !s_relay_error_active) {
+                s_relay_error_active = true;
+
+                // Connection failed = blinking red
+                set_state(DISP_ERROR);
+            }
+
+            continue;
+        }
+
+        // Relay is reachable
+        s_relay_fail_count = 0;
+
+        if (s_relay_error_active) {
+            s_relay_ok_count++;
+
+            ESP_LOGI(TAG, "Relay health restored %d/2", s_relay_ok_count);
+
+            if (s_relay_ok_count >= 2) {
+                s_relay_error_active = false;
+                s_relay_ok_count = 0;
+
+                // E change: temporary relay restored notification
+                show_transition_state(DISP_RELAY_RESTORED, 1000);
+            }
         } else {
-            ESP_LOGW(TAG, "Offline relay status failed");
-            set_state(DISP_RELAY_FAIL);
+            ESP_LOGI(TAG, "Offline relay live");
         }
     }
 }
@@ -1307,6 +1646,7 @@ void app_main(void) {
     }
 
     display_init();
+    status_led_init();
     display_update(DISP_BOOTING);
 
     xTaskCreatePinnedToCore(
@@ -1363,6 +1703,16 @@ void app_main(void) {
     );
 
     xTaskCreatePinnedToCore(
+        server_health_task,
+        "ServerHealth",
+        4096,
+        NULL,
+        3,
+        NULL,
+        0
+    );
+
+    xTaskCreatePinnedToCore(
         server_reconnect_task,
         "ServerRetry",
         4096,
@@ -1382,6 +1732,10 @@ void app_main(void) {
         start_home_relay_mode("server unavailable during boot");
         return;
     }
+
+    // Server connected successfully.
+    // Current mode colour = blue.
+    status_led_set_mode(STATUS_LED_MODE_ONLINE);
 
     xTaskCreatePinnedToCore(
         zyra_task,

@@ -42,6 +42,16 @@ static TaskHandle_t s_voice_task_handle = NULL;
 static volatile bool s_voice_running = false;
 
 static offline_voice_callback_t s_command_callback = NULL;
+static offline_voice_ui_callback_t s_ui_callback = NULL;
+static void offline_voice_emit_ui(OfflineVoiceUiEvent event) {
+    if (s_ui_callback) {
+        s_ui_callback(event);
+    }
+}
+
+static bool offline_voice_should_abort_wakeword(void) {
+    return !s_voice_running;
+}
 
 static srmodel_list_t* s_models = NULL;
 static esp_mn_iface_t* s_multinet = NULL;
@@ -319,103 +329,150 @@ static void offline_voice_task(void* arg) {
     s_multinet->clean(s_model_data);
 
     while (s_voice_running) {
+        offline_voice_emit_ui(OFFLINE_VOICE_UI_IDLE);
+
         ESP_LOGI(TAG, "Offline mode waiting for wake word");
 
-        if (!wakeword_wait_blocking()) {
+        if (!wakeword_wait_blocking_abortable(
+                offline_voice_should_abort_wakeword
+            )) {
+            if (!s_voice_running) {
+                ESP_LOGI(TAG, "Offline wake wait cancelled");
+                break;
+            }
+
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
         ESP_LOGI(TAG, "Offline wake detected. Listening for command.");
+
+        // Wakeword accepted: show small listening pulse.
+        offline_voice_emit_ui(OFFLINE_VOICE_UI_LISTENING);
+
+        // Let the user visually see LISTENING before command capture starts.
+        // Also prevents the tail of "Jarvis" from entering MultiNet.
+        vTaskDelay(pdMS_TO_TICKS(700));
+
         s_multinet->clean(s_model_data);
 
-        int filled = 0;
+        bool command_session_active = true;
+        bool hearing_started = false;
 
-        while (filled < chunk_size && s_voice_running) {
-            int request = chunk_size - filled;
+        TickType_t command_start = xTaskGetTickCount();
+        const uint32_t command_timeout_ms = 6500;
 
-            if (request > 256) {
-                request = 256;
+        while (s_voice_running && command_session_active) {
+            uint32_t elapsed_ms =
+                (xTaskGetTickCount() - command_start) * portTICK_PERIOD_MS;
+
+            if (elapsed_ms >= command_timeout_ms) {
+                ESP_LOGI(TAG, "Offline command listen timeout");
+                s_multinet->clean(s_model_data);
+                offline_voice_emit_ui(OFFLINE_VOICE_UI_IDLE);
+                break;
             }
 
-            int count = audio_read_wakenet_frame(
-                audio_chunk + filled,
-                request
-            );
+            int filled = 0;
 
-            if (count > 0) {
-                filled += count;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-        }
+            while (filled < chunk_size && s_voice_running) {
+                int request = chunk_size - filled;
 
-        if (!s_voice_running) {
-            break;
-        }
+                if (request > 256) {
+                    request = 256;
+                }
 
-        int peak = apply_offline_voice_gain(audio_chunk, chunk_size);
-
-        if (peak < OFFLINE_VOICE_MIN_PEAK) {
-            continue;
-        }
-
-        esp_mn_state_t state = s_multinet->detect(
-            s_model_data,
-            audio_chunk
-        );
-
-        if (state == ESP_MN_STATE_DETECTING) {
-            continue;
-        }
-
-        if (state == ESP_MN_STATE_DETECTED) {
-            esp_mn_results_t* result =
-                s_multinet->get_results(s_model_data);
-
-            if (result && result->num > 0) {
-                int command_id = result->command_id[0];
-                float probability = result->prob[0];
-
-                const char* phrase = result->string;
-
-                ESP_LOGI(
-                    TAG,
-                    "Detected offline command id=%d phrase='%s' prob=%.3f",
-                    command_id,
-                    phrase,
-                    probability
+                int count = audio_read_wakenet_frame(
+                    audio_chunk + filled,
+                    request
                 );
 
-                if (probability >= OFFLINE_VOICE_MIN_PROB &&
-                    s_command_callback) {
-
-                    s_command_callback(
-                        (OfflineVoiceCommand)command_id,
-                        phrase,
-                        probability
-                    );
+                if (count > 0) {
+                    filled += count;
                 } else {
-                    ESP_LOGW(TAG,
-                        "Ignored low-confidence offline command: %.3f",
-                        probability);
+                    vTaskDelay(pdMS_TO_TICKS(10));
                 }
             }
 
-            s_multinet->clean(s_model_data);
+            if (!s_voice_running) {
+                break;
+            }
 
-            // Small cooldown so the same phrase does not fire repeatedly.
-            vTaskDelay(pdMS_TO_TICKS(900));
-            continue;
+            int peak = apply_offline_voice_gain(audio_chunk, chunk_size);
+
+            // Once real speech energy appears, switch to bigger active pulse.
+            if (!hearing_started && peak >= OFFLINE_VOICE_MIN_PEAK) {
+                hearing_started = true;
+                offline_voice_emit_ui(OFFLINE_VOICE_UI_HEARING);
+            }
+
+            esp_mn_state_t state = s_multinet->detect(
+                s_model_data,
+                audio_chunk
+            );
+
+            if (state == ESP_MN_STATE_DETECTING) {
+                // Stay inside the command-listening loop.
+                continue;
+            }
+
+            if (state == ESP_MN_STATE_DETECTED) {
+                esp_mn_results_t* result =
+                    s_multinet->get_results(s_model_data);
+
+                if (result && result->num > 0) {
+                    int command_id = result->command_id[0];
+                    float probability = result->prob[0];
+                    const char* phrase = result->string;
+
+                    ESP_LOGI(
+                        TAG,
+                        "Detected offline command id=%d phrase='%s' prob=%.3f",
+                        command_id,
+                        phrase,
+                        probability
+                    );
+
+                    if (probability >= OFFLINE_VOICE_MIN_PROB &&
+                        s_command_callback) {
+
+                        offline_voice_emit_ui(OFFLINE_VOICE_UI_THINKING);
+
+                        s_command_callback(
+                            (OfflineVoiceCommand)command_id,
+                            phrase,
+                            probability
+                        );
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "Ignored low-confidence offline command: %.3f",
+                            probability
+                        );
+                        offline_voice_emit_ui(OFFLINE_VOICE_UI_IDLE);
+                    }
+                }
+
+                s_multinet->clean(s_model_data);
+
+                // Small cooldown so the same phrase does not fire repeatedly.
+                vTaskDelay(pdMS_TO_TICKS(900));
+
+                command_session_active = false;
+                break;
+            }
+
+            if (state == ESP_MN_STATE_TIMEOUT) {
+                ESP_LOGI(TAG, "Offline voice command timeout");
+                s_multinet->clean(s_model_data);
+                offline_voice_emit_ui(OFFLINE_VOICE_UI_IDLE);
+
+                command_session_active = false;
+                break;
+            }
+
+            ESP_LOGW(TAG, "Offline voice unknown state: %d", state);
         }
-
-        if (state == ESP_MN_STATE_TIMEOUT) {
-            ESP_LOGI(TAG, "Offline voice command timeout");
-            s_multinet->clean(s_model_data);
-            continue;
-        }
-
-        ESP_LOGW(TAG, "Offline voice unknown state: %d", state);
     }
 
     free(audio_chunk);
@@ -465,9 +522,28 @@ void offline_voice_stop(void) {
     }
 
     ESP_LOGW(TAG, "Stopping offline voice recognizer");
-    s_voice_running = false;
-}
 
+    s_voice_running = false;
+
+    // Wait briefly for the offline task to exit.
+    for (int i = 0; i < 40; i++) {
+        if (s_voice_task_handle == NULL) {
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (s_voice_task_handle != NULL) {
+        ESP_LOGW(TAG, "Offline voice task did not stop quickly");
+    }
+}
 bool offline_voice_is_running(void) {
     return s_voice_running;
+}
+
+void offline_voice_set_ui_callback(
+    offline_voice_ui_callback_t callback
+) {
+    s_ui_callback = callback;
 }

@@ -40,6 +40,20 @@ typedef void (*offline_voice_callback_t)(
     float probability
 );
 
+typedef enum {
+    OFFLINE_VOICE_UI_IDLE = 0,
+    OFFLINE_VOICE_UI_LISTENING,
+    OFFLINE_VOICE_UI_HEARING,
+    OFFLINE_VOICE_UI_THINKING,
+    OFFLINE_VOICE_UI_SPEAKING,
+    OFFLINE_VOICE_UI_ERROR
+} OfflineVoiceUiEvent;
+
+typedef void (*offline_voice_ui_callback_t)(
+    OfflineVoiceUiEvent event
+);
+
 esp_err_t offline_voice_start(offline_voice_callback_t callback);
 void offline_voice_stop(void);
 bool offline_voice_is_running(void);
+void offline_voice_set_ui_callback(offline_voice_ui_callback_t callback);

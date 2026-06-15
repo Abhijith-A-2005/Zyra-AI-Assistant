@@ -244,33 +244,83 @@ size_t audio_capture_utterance(uint8_t* buffer,
 esp_err_t audio_play_response(const uint8_t* data,
                                size_t len,
                                int sample_rate) {
-    if (!tx_handle) return ESP_FAIL;
+    if (!tx_handle || !data || len == 0) {
+        return ESP_FAIL;
+    }
 
-    i2s_channel_disable(tx_handle);
+    static int s_current_tx_sample_rate = 0;
 
-    i2s_std_clk_config_t clk = {
-        .sample_rate_hz = sample_rate,
-        .clk_src        = I2S_CLK_SRC_DEFAULT,
-        .mclk_multiple  = I2S_MCLK_MULTIPLE_256
-    };
-    i2s_channel_reconfig_std_clock(tx_handle, &clk);
-    i2s_channel_enable(tx_handle);
+    if (s_current_tx_sample_rate != sample_rate) {
+        esp_err_t err;
 
+        err = i2s_channel_disable(tx_handle);
+
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "I2S TX disable before reconfig returned: %s",
+                     esp_err_to_name(err));
+        }
+
+        i2s_std_clk_config_t clk = {
+            .sample_rate_hz = sample_rate,
+            .clk_src        = I2S_CLK_SRC_DEFAULT,
+            .mclk_multiple  = I2S_MCLK_MULTIPLE_256
+        };
+
+        err = i2s_channel_reconfig_std_clock(tx_handle, &clk);
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "I2S TX clock reconfig failed: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        err = i2s_channel_enable(tx_handle);
+
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "I2S TX enable failed: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        s_current_tx_sample_rate = sample_rate;
+
+        ESP_LOGI(TAG, "I2S TX configured at %dHz", sample_rate);
+    }
+
+    size_t offset = 0;
     size_t written = 0;
-    size_t offset  = 0;
-    size_t chunk   = 1024;
+
+    const size_t write_chunk = 4096;
 
     while (offset < len) {
-        size_t to_write = (len - offset) < chunk ?
-                          (len - offset) : chunk;
-        i2s_channel_write(tx_handle,
-                          data + offset,
-                          to_write, &written,
-                          pdMS_TO_TICKS(1000));
+        size_t to_write = len - offset;
+
+        if (to_write > write_chunk) {
+            to_write = write_chunk;
+        }
+
+        esp_err_t err = i2s_channel_write(
+            tx_handle,
+            data + offset,
+            to_write,
+            &written,
+            pdMS_TO_TICKS(1000)
+        );
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        if (written == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
         offset += written;
     }
 
-    ESP_LOGI(TAG, "Played %d bytes", len);
+    ESP_LOGI(TAG, "Played %zu bytes at %dHz", len, sample_rate);
     return ESP_OK;
 }
 

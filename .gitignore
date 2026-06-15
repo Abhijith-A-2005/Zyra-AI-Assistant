@@ -11,12 +11,8 @@ zyra-server/*.db
 zyra-server/**/*.db
 zyra-server/**/*.sqlite3
 
-# Large local model files
-zyra-server/models/*.onnx
-zyra-server/models/*.bin
-zyra-server/models/*.pt
-zyra-server/models/*.gguf
-!zyra-server/models/*.json
+# Local/downloaded model files
+zyra-server/models/
 
 # ESP-IDF
 zyra-firmware/build/
@@ -68,6 +64,9 @@ zyra-firmware/sdkconfig.defaults.old
 # Private local notes
 TODO.local.md
 notes.local.md
+
+# Local helper scripts / one-time generation tools
+zyra-server/tools/
 
 # Smart-home local config / secrets
 zyra-server/smart_home.local.json

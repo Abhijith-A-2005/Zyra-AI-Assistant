@@ -64,7 +64,9 @@ esp_err_t wakeword_engine_init(void) {
     return ESP_OK;
 }
 
-bool wakeword_wait_blocking(void) {
+bool wakeword_wait_blocking_abortable(
+    wakeword_abort_fn_t should_abort
+) {
     if (!s_wn || !s_wn_data || s_wn_chunksize <= 0) {
         ESP_LOGE(TAG, "WakeNet not initialized");
         return false;
@@ -81,7 +83,19 @@ bool wakeword_wait_blocking(void) {
     int debug_counter = 0;
 
     while (true) {
+        if (should_abort && should_abort()) {
+            ESP_LOGI(TAG, "WakeNet wait aborted");
+            free(frame);
+            return false;
+        }
+
         int count = audio_read_wakenet_frame(frame, s_wn_chunksize);
+
+        if (should_abort && should_abort()) {
+            ESP_LOGI(TAG, "WakeNet wait aborted after read");
+            free(frame);
+            return false;
+        }
 
         if (count != s_wn_chunksize) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -92,7 +106,7 @@ bool wakeword_wait_blocking(void) {
         int64_t sum_sq = 0;
 
         for (int i = 0; i < s_wn_chunksize; i++) {
-            int32_t boosted = (int32_t)frame[i] * 6;
+            int32_t boosted = (int32_t)frame[i] * 4;
 
             if (boosted > 32767) boosted = 32767;
             if (boosted < -32768) boosted = -32768;
@@ -120,4 +134,8 @@ bool wakeword_wait_blocking(void) {
             return true;
         }
     }
+}
+
+bool wakeword_wait_blocking(void) {
+    return wakeword_wait_blocking_abortable(NULL);
 }

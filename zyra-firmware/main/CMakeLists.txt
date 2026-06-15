@@ -8,6 +8,7 @@ idf_component_register(
         "offline_voice.c"
         "offline_speech.c"
         "wakeword_engine.c"
+        "status_led.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -23,6 +24,7 @@ idf_component_register(
         freertos
         json
         spiffs
+        led_strip
         log
     PRIV_REQUIRES
         esp_timer

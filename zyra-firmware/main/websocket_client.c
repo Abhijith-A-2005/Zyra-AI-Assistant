@@ -21,6 +21,7 @@ static bool     response_ready  = false;
 static uint8_t* response_buffer = NULL;
 static size_t   response_len    = 0;
 static int      response_sr     = 22050;
+static bool     response_final  = true;
 static bool     audio_incoming  = false;
 static size_t   audio_expected  = 0;
 
@@ -81,6 +82,7 @@ static void ws_event_handler(void* arg,
                     cJSON* status = cJSON_GetObjectItem(json, "status");
                     cJSON* ab     = cJSON_GetObjectItem(json, "audio_bytes");
                     cJSON* sr     = cJSON_GetObjectItem(json, "sample_rate");
+                    cJSON* final  = cJSON_GetObjectItem(json, "final");
 
                     // Server says no valid speech was detected.
                     // Treat this as a completed response with zero audio,
@@ -141,11 +143,18 @@ static void ws_event_handler(void* arg,
                         response_len   = 0;
                         response_ready = false;
 
-                        xSemaphoreGive(response_mutex);
-
                         if (sr && cJSON_IsNumber(sr)) {
                             response_sr = sr->valueint;
                         }
+
+                        if (final) {
+                            response_final = cJSON_IsTrue(final);
+                            } else {
+                                // Old non-streaming protocol is treated as one final chunk.
+                                response_final = true;
+                        }
+
+                        xSemaphoreGive(response_mutex);
 
                         ESP_LOGI(TAG,
                             "Expecting %d bytes audio at %d Hz",
@@ -316,6 +325,7 @@ esp_err_t ws_send_audio(const uint8_t* data,
     audio_expected  = 0;
     audio_incoming  = false;
     response_ready  = false;
+    response_final = true;
 
     xSemaphoreGive(response_mutex);
 
@@ -340,6 +350,20 @@ size_t ws_get_response(uint8_t** data,
     response_ready = false;
     xSemaphoreGive(response_mutex);
     return len;
+}
+
+bool ws_response_final(void) {
+    bool final = true;
+
+    if (!response_mutex) {
+        return true;
+    }
+
+    xSemaphoreTake(response_mutex, portMAX_DELAY);
+    final = response_final;
+    xSemaphoreGive(response_mutex);
+
+    return final;
 }
 
 void ws_free_response(void) {

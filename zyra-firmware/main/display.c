@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <math.h>
 
 static const char* TAG = "DISPLAY";
@@ -18,6 +19,7 @@ static const char* TAG = "DISPLAY";
 
 static i2c_master_dev_handle_t s_i2c_dev = NULL;
 static uint8_t fb[OLED_WIDTH * OLED_HEIGHT / 8];
+static bool s_oled_on = true;
 static volatile DisplayState current_state
     = DISP_BOOTING;
 void display_set_state(DisplayState state) {
@@ -48,6 +50,17 @@ static void oled_write(uint8_t* data, size_t len) {
 static void oled_cmd(uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};
     oled_write(buf, 2);
+}
+
+static void oled_power(bool on) {
+    if (!s_i2c_dev) return;
+
+    if (s_oled_on == on) {
+        return;
+    }
+
+    oled_cmd(on ? 0xAF : 0xAE);
+    s_oled_on = on;
 }
 
 static void oled_data_buf(uint8_t* data, size_t len) {
@@ -211,6 +224,17 @@ esp_err_t display_init(void) {
 // ── Display update ────────────────────────────────
 void display_update(DisplayState state) {
     current_state = state;
+
+    if (state == DISP_IDLE) {
+        if (s_oled_on) {
+            fb_clear();
+            fb_flush();
+            oled_power(false);
+        }
+        return;
+    }
+
+    oled_power(true);
     fb_clear();
 
     switch (state) {
@@ -233,12 +257,18 @@ void display_update(DisplayState state) {
             break;
 
         case DISP_IDLE:
+            // OLED is powered off before the switch.
+            return;
+
+        case DISP_WAKE_DETECTED:
+        case DISP_LISTENING:
             fb_text(22, 2, "LISTENING");
             fb_hline(0, 14, 128);
+
             {
-                uint32_t t = xTaskGetTickCount()
-                    / (500 / portTICK_PERIOD_MS);
+                uint32_t t = xTaskGetTickCount() / pdMS_TO_TICKS(500);
                 int r = (t % 2 == 0) ? 8 : 5;
+
                 for (int a = 0; a < 360; a += 15) {
                     float rad = a * 3.14159f / 180.0f;
                     int x = 64 + (int)(r * cosf(rad));
@@ -247,28 +277,35 @@ void display_update(DisplayState state) {
                 }
             }
             break;
+        
+            case DISP_HEARING:
+                fb_text(22, 2, "LISTENING");
+                fb_hline(0, 14, 128);
 
-        case DISP_WAKE_DETECTED:
-            fb_text(34, 8, "ZYRA");
-            fb_hline(0, 20, 128);
-            fb_text(22, 30, "LISTENING");
-            fb_text(28, 46, "...");
-            break;
+                {
+                    uint32_t tick = xTaskGetTickCount();
 
-        case DISP_LISTENING:
-            fb_text(22, 2, "LISTENING");
-            fb_hline(0, 14, 128);
-            {
-                uint32_t t = xTaskGetTickCount()
-                    / (150 / portTICK_PERIOD_MS);
-                int heights[] = {8,14,20,16,10,18,12,6};
-                for (int i = 0; i < 8; i++) {
-                    int h = heights[(t + i) % 8];
-                    fb_rect(16 + i * 14, 50 - h,
-                             8, h, 1);
+                    uint32_t phase = (tick / pdMS_TO_TICKS(80)) * 12;
+                    uint32_t pulse = (tick / pdMS_TO_TICKS(90)) % 12;
+
+                    int grow = pulse < 6 ? pulse : 12 - pulse;
+                    int r = 11 + grow;
+
+                    for (int a = 0; a < 360; a += 12) {
+                        float rad = (a + phase) * 3.14159f / 180.0f;
+                        int x = 64 + (int)(r * cosf(rad));
+                        int y = 38 + (int)(r * sinf(rad));
+                        fb_pixel(x, y, 1);
+                    }
+
+                    // Small center dot so it feels alive, not empty.
+                    fb_pixel(64, 38, 1);
+                    fb_pixel(63, 38, 1);
+                    fb_pixel(65, 38, 1);
+                    fb_pixel(64, 37, 1);
+                    fb_pixel(64, 39, 1);
                 }
-            }
-            break;
+                break;
 
         case DISP_PROCESSING:
             fb_text(22, 8, "THINKING");
@@ -320,6 +357,24 @@ void display_update(DisplayState state) {
             fb_text(28, 8, "RELAY");
             fb_hline(0, 20, 128);
             fb_text(28, 34, "FAILED");
+            break;
+
+        case DISP_SERVERLESS:
+            fb_text(14, 8, "SERVERLESS");
+            fb_hline(0, 20, 128);
+            fb_text(20, 34, "LOCAL MODE");
+            break;
+
+        case DISP_ONLINE_RESTORED:
+            fb_text(28, 8, "ONLINE");
+            fb_hline(0, 20, 128);
+            fb_text(18, 34, "SERVER BACK");
+            break;
+
+        case DISP_RELAY_RESTORED:
+            fb_text(28, 8, "RELAY");
+            fb_hline(0, 20, 128);
+            fb_text(24, 34, "RESTORED");
             break;
 
         case DISP_CUSTOM:
