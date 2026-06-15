@@ -2,25 +2,13 @@
 
 ZYRA is a custom local smart home voice assistant built using an **ESP32-S3** and a **Python AI server**.
 
-The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Piper TTS, and plays them back through a MAX98357 I2S amplifier.
+The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Kokoro TTS with the af_heart voice, and plays them back through a MAX98357 I2S amplifier.
 
-The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display,wake through a local hardware wakeword, and intelligently understand smart-home commands such as turning devices on, turning devices off, checking device status, and controlling grouped home-theater devices without depending on cloud assistants.
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, provide RGB LED feedback, wake through a local hardware wakeword, and intelligently understand smart-home commands such as turning devices on, turning devices off, checking device status, and controlling grouped home-theater devices without depending on cloud assistants.
 
-The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, and offline relay connectivity support.
-
-
-The project now includes:
-
-* Server-side smart-home intent intelligence
-* Local relay-board HTTP control
-* ESP32-S3 online voice pipeline
-* Firmware-side offline relay fallback
-* Firmware-side offline speech connectivity support
-* SPIFFS-based offline assets
-* Local wakeword firmware
+The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, RGB status LED feedback, and offline relay connectivity support.
 
 ---
-
 
 ## Project Structure
 
@@ -44,8 +32,7 @@ ZYRA/
 │   ├── test_tts_api.py
 │   ├── test_websocket.py
 │   ├── tts.py
-│   └── models/
-│       └── en_US-lessac-high.onnx.json
+│   
 │
 └── zyra-firmware/
     ├── .gitignore
@@ -101,6 +88,8 @@ ZYRA/
         ├── offline_speech.h
         ├── offline_voice.c
         ├── offline_voice.h
+        ├── status_led.c
+        ├── status_led.h
         ├── wakeword_engine.c
         ├── wakeword_engine.h
         ├── websocket_client.c
@@ -120,7 +109,7 @@ It handles:
 
 * Speech-to-text using Faster-Whisper
 * AI response generation using Ollama
-* Text-to-speech using Piper
+* Text-to-speech using Kokoro TTS
 * Memory using ChromaDB and SQLite
 * Intent routing for assistant and smart-home commands
 * Smart-home command understanding
@@ -135,12 +124,12 @@ Important files:
 | `config.py`          | Server, model, audio, memory, and smart-home configuration                         |
 | `intent_router.py`   | Routes transcripts into assistant chat or smart-home control intents               |
 | `smart_home.py`      | Handles smart-home command execution and forwards HTTP requests to the relay board |
-| `stt.py`             | Speech-to-text engine using Faster-Whisper                                         |
-| `llm.py`             | Ollama LLM engine for natural assistant responses                                  |
-| `tts.py`             | Piper text-to-speech engine                                                        |
+| `stt.py`             | Speech-to-text engine using Faster-Whisper with hallucination filtering            |
+| `llm.py`             | Ollama LLM engine with warmup and persistent model loading                         |
+| `tts.py`             | Kokoro text-to-speech engine                                                        |
 | `memory.py`          | ChromaDB and SQLite memory handling                                                |
-| `test_components.py` | Tests Ollama, Whisper, Piper, and memory                                           |
-| `test_tts_api.py`    | Tests Piper TTS behavior                                                           |
+| `test_components.py` | Tests Ollama, Whisper, Kokoro, and memory                                           |
+| `test_tts_api.py`    | Tests Kokoro TTS behavior                                                           |
 | `test_websocket.py`  | Tests the WebSocket pipeline                                                       |
 | `.env.example`       | Example environment configuration                                                  |
 | `requirements.txt`   | Python dependencies                                                                |
@@ -157,10 +146,11 @@ It handles:
 * Local Jarvis wakeword detection using ESP-SR WakeNet
 * WebSocket connection to the ZYRA server
 * Runtime detection of server disconnects
-* Automatic fallback to offline relay modes
+* Automatic fallback to offline relay mode
 * Offline voice command recognition using ESP-SR MultiNet
 * Offline speech prompt playback from SPIFFS
 * Offline relay-board HTTP communication
+* RGB status LED feedback
 * INMP441 microphone input
 * MAX98357 speaker output
 * OLED display states
@@ -182,6 +172,8 @@ Important files:
 | `main/offline_speech.h`      | Offline speech prompt API                                                                                |
 | `main/offline_relay.c`       | Offline relay HTTP client, relay status sync, toggle, and group control logic                            |
 | `main/offline_relay.h`       | Offline relay device/action definitions and API                                                          |
+| `main/status_led.c`          | Onboard RGB LED status engine                                                                            |
+| `main/status_led.h`          | Status LED mode and state definitions                                                                    |
 | `main/websocket_client.c`    | ESP32 WebSocket client with disconnect callback and stop support                                         |
 | `main/websocket_client.h`    | WebSocket client header                                                                                  |
 | `main/display.c`             | OLED display handling, including wakeword, offline, relay, and speaking states                           |
@@ -193,11 +185,54 @@ Important files:
 
 ---
 
+## Runtime Refinements
+
+This version includes refinements to make ZYRA feel more stable and appliance-like during real use.
+
+Current refinements include:
+
+* Improved wakeword flow
+* Improved offline voice listening flow
+* Better offline relay fallback behavior
+* RGB LED mode/state feedback
+* OLED state feedback for online, serverless, offline, listening, thinking, speaking, and error states
+* SPIFFS-based prompt playback for offline relay confirmations
+* Jarvis-style Kokoro voice configuration support
+* Better STT rejection for silence, low-level noise, and common Whisper hallucinations
+* LLM warmup to reduce first-response cold-start delay
+
+---
+
+## RGB Status LED Feedback
+
+ZYRA uses the ESP32-S3 onboard RGB LED for quick visual feedback.
+
+Mode colors:
+
+| Mode       | LED Color      | Meaning                                                          |
+| ---------- | -------------- | ---------------------------------------------------------------- |
+| Online     | Blue           | ESP32-S3 is connected to the ZYRA server                         |
+| Serverless | Purple         | Server path is unavailable but local fallback behavior is active |
+| Offline    | Amber / Orange | Offline relay mode is active                                     |
+
+State colors:
+
+| State                      | LED Behavior                 |
+| -------------------------- | ---------------------------- |
+| Idle                       | Off                          |
+| Listening / active mode    | Solid current mode color     |
+| Thinking / processing      | Breathing current mode color |
+| Speaking / command success | Green                        |
+| Command failed             | Solid red                    |
+| Connection failed          | Blinking red                 |
+
+---
+
 ## Wakeword Support
 
-ZYRA now includes hardware wakeword support on the ESP32-S3.
+ZYRA includes hardware wakeword support on the ESP32-S3.
 
-The current wakeword is:
+Current wakeword:
 
 ```text
 Jarvis
@@ -306,6 +341,7 @@ Offline relay connectivity focuses on:
 * Using relay status from `/status`
 * Tracking relay states for TV, soundbar, subwoofer, and rear speakers
 * Showing offline and relay status on the OLED display
+* Updating RGB LED mode/state feedback
 
 Important note:
 
@@ -321,7 +357,7 @@ The offline relay firmware module provides local relay-board connectivity and re
 
 ## Offline Voice Commands
 
-ZYRA now includes firmware-side offline voice command recognition.
+ZYRA includes firmware-side offline voice command recognition.
 
 This is a limited local fallback mode using ESP-SR MultiNet. It is meant for relay-control commands when the Python server is unavailable.
 
@@ -363,7 +399,7 @@ Current limitation:
 ```text
 Offline voice mode is for limited relay-control commands only.
 
-Full natural conversation, full STT, LLM reasoning, memory, and Piper TTS still require the ZYRA Python server.
+Full natural conversation, full STT, LLM reasoning, memory, and Kokoro TTS still require the ZYRA Python server.
 ```
 
 ---
@@ -457,6 +493,7 @@ Rear speakers OFF
 * INMP441 I2S microphone
 * MAX98357A I2S amplifier
 * 0.96 inch SSD1306 OLED display
+* Onboard RGB LED on ESP32-S3
 * Speaker
 * PC or laptop for running the ZYRA server
 * Separate ESP8266 Smart Extension relay board
@@ -499,29 +536,20 @@ Install project dependencies:
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m pip install piper-tts
 ```
 
 ---
 
-## Piper Model Setup
+## Kokoro TTS Setup
 
-The Piper `.onnx` voice model is not included in GitHub because it is a large file.
+ZYRA uses Kokoro TTS with the `af_heart` voice for online spoken responses.
 
-Required local files:
-
-```text
-zyra-server/models/en_US-lessac-high.onnx
-zyra-server/models/en_US-lessac-high.onnx.json
-```
-
-Only the `.json` config file is committed.
-
-Copy the `.onnx` model manually into:
+Offline voice prompts are pre-generated WAV files stored inside:
 
 ```text
-zyra-server/models/
+zyra-firmware/spiffs/
 ```
+They are included in the repository and are flashed automatically with the ESP32 SPIFFS image.
 
 ---
 
@@ -618,7 +646,7 @@ Expected:
 ```text
 ✓ Ollama working
 ✓ Whisper working
-✓ Piper TTS working
+✓ Kokoro TTS working
 ✓ Memory working
 ✓✓✓ All components working
 ```
@@ -785,6 +813,7 @@ WiFi connected
 Mic initialized on I2S port 1
 Amp initialized on I2S port 0
 Wakeword engine ready
+Status LED initialized
 Say Jarvis
 Connected to ZYRA server
 ZYRA online
@@ -843,6 +872,12 @@ Offline relay status synced
 | VCC  | 3.3V     |
 | GND  | GND      |
 
+### Onboard RGB LED
+
+| LED     | ESP32-S3 |
+| ------- | -------- |
+| RGB LED | GPIO 48  |
+
 ---
 
 ## Important Notes
@@ -853,7 +888,6 @@ Do not commit:
 zyra-server/.venv/
 zyra-server/.env
 zyra-server/memory/
-zyra-server/models/*.onnx
 zyra-firmware/build/
 zyra-firmware/main/zyra_config.h
 zyra-repomix-output.xml
@@ -863,7 +897,6 @@ Safe to commit:
 
 ```text
 zyra-server/.env.example
-zyra-server/models/en_US-lessac-high.onnx.json
 zyra-firmware/main/zyra_config.example.h
 zyra-firmware/sdkconfig
 zyra-firmware/spiffs/
@@ -898,7 +931,17 @@ Check:
 * `esp-sr` is listed under `REQUIRES` in `main/CMakeLists.txt`
 * `wakeword_engine.c` is included under `SRCS`
 * ESP-IDF Component Manager has downloaded ESP-SR
-* `idf.py reconfigure` was run after dependency changes
+* Run `idf.py reconfigure` after dependency changes
+
+### RGB LED is not working
+
+Check:
+
+* Your ESP32-S3 board has an onboard addressable RGB LED
+* The RGB LED GPIO is GPIO 48
+* `led_strip` dependency is available
+* `status_led.c` is included in the firmware build
+* The LED is not disabled by board hardware configuration
 
 ### ESP32 connects to Wi-Fi but not server
 
@@ -955,13 +998,6 @@ Check:
 * SPIFFS image is flashed into the `storage` partition
 * MAX98357 pins match `audio_pipeline.c`
 
-### Piper model not found
-
-Make sure this file exists:
-
-```text
-zyra-server/models/en_US-lessac-high.onnx
-```
 
 ### Capture buffer allocation failed
 
@@ -994,7 +1030,9 @@ Completed:
 * PC-side AI server
 * Faster-Whisper STT
 * Ollama LLM
-* Piper TTS
+* LLM warmup for lower first-request delay
+* Kokoro TTS
+* Jarvis-style Kokoro voice configuration
 * Memory engine
 * Intent routing
 * Smart-home command understanding
@@ -1013,6 +1051,7 @@ Completed:
 * Firmware-side offline speech prompt playback
 * SPIFFS asset support for offline mode
 * OLED states for wakeword and offline relay mode
+* RGB status LED feedback for online, serverless, offline, speaking, success, error, and connection failure states
 
 Not included yet:
 
@@ -1020,13 +1059,3 @@ Not included yet:
 * Full natural conversation directly on the ESP32-S3
 * Final UI appearance upgrade
 * Smart Extension relay-board firmware inside this repository
-
-Next:
-
-* Commit wakeword firmware milestone
-* End-to-end Jarvis wakeword testing
-* End-to-end smart-home voice testing
-* Offline relay command execution testing
-* Offline voice command testing
-* OLED/UI appearance upgrade
-* Separate Smart Extension / Smart-Switch-Board repository cleanup
