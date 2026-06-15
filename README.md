@@ -542,10 +542,12 @@ python -m pip install -r requirements.txt
 
 ## Kokoro TTS Setup
 
-ZYRA uses Kokoro TTS with the `af_heart` voice for online spoken responses.
+Online TTS:
+- Generated live by Kokoro in zyra-server/tts.py.
 
-Offline voice prompts are pre-generated WAV files stored inside:
-
+Offline TTS:
+- Fixed WAV prompts stored in zyra-firmware/spiffs.
+- These files are flashed into the ESP32-S3 storage SPIFFS partition
 ```text
 zyra-firmware/spiffs/
 ```

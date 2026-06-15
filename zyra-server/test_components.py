@@ -37,13 +37,17 @@ def test_whisper():
 
 
 def test_tts():
-    print("\n── Testing Piper TTS ───────────────")
+    print("\n── Testing Kokoro TTS ──────────────")
     from tts import TTSEngine
-    tts   = TTSEngine()
+
+    tts = TTSEngine(name="test", prewarm=False)
     audio = tts.synthesize("ZYRA is online and ready.")
+
     print(f"Audio bytes generated: {len(audio)}")
-    assert len(audio) > 0, "TTS returned no audio"
-    print("✓ Piper TTS working")
+
+    assert len(audio) > 0, "Kokoro TTS returned no audio"
+
+    print("✓ Kokoro TTS working")
 
 
 def test_memory():

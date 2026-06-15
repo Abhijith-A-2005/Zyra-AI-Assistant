@@ -14,7 +14,7 @@
 
 // ESP8266 home Wi-Fi IP.
 // This is used when Zyra is still connected to home Wi-Fi.
-#define RELAY_HOME_BASE_URL "http://192.168.29.97"
+#define RELAY_HOME_BASE_URL  "192.168.x.x" //YOUR_RELAY_BOARD_HOME_IP"
 
 // ESP8266 direct AP IP.
 // This is used only when home Wi-Fi itself fails.

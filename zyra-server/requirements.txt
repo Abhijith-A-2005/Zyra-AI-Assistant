@@ -55,7 +55,6 @@ orjson==3.11.9
 overrides==7.7.0
 packaging==26.2
 pathvalidate==3.3.1
-piper-tts==1.4.2
 propcache==0.5.2
 protobuf==6.33.6
 pybase64==1.4.3
