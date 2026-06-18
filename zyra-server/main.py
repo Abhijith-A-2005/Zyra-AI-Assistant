@@ -1027,12 +1027,9 @@ async def zyra_websocket(websocket: WebSocket):
 async def health():
     return {
         "status": "online",
-        "model":  llm.model,
+        "model": llm.model,
         "memory": "connected",
-        "smart_home": {
-            "configured_urls": smart_home.base_urls,
-            "active_url": smart_home.active_base_url,
-        }
+        "smart_home": smart_home.health_snapshot(),
     }
 
 

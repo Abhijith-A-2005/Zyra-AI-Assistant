@@ -2,9 +2,18 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-import requests
+from config import (
+    HOME_ASSISTANT_URL,
+    HOME_ASSISTANT_TOKEN,
+    HOME_ASSISTANT_TIMEOUT_SEC,
+    HOME_ASSISTANT_ENTITIES,
+    RELAY_HOME_BASE_URLS,
+    RELAY_HTTP_TIMEOUT_SEC,
+)
 
-from config import SMART_HOME_BASE_URLS, SMART_HOME_TIMEOUT_SEC
+from home_assistant_client import HomeAssistantClient
+from relay_http_client import RelayHttpClient
+from smart_home_backends import SmartHomeBackend
 from intent_router import RoutedIntent, RoutedCommand
 
 logger = logging.getLogger(__name__)
@@ -16,65 +25,76 @@ class SmartHomeResult:
     response: str
     action: str = ""
     devices: Optional[list[str]] = None
+    backend: str = ""
 
 
 class SmartHomeEngine:
     """
     Executes validated smart-home intents.
 
+    Mode 1:
+        Zyra Server → Home Assistant → MQTT → ESP8266
+
+    Mode 2:
+        Zyra Server → ESP8266 Home IP direct relay fallback
+
     This class does not understand natural language.
-    It only receives structured intents and talks to the ESP8266 relay board.
+    It only receives structured intents from IntentRouter.
     """
 
+    DEVICE_ORDER = ["tv", "soundbar", "subwoofer", "rear"]
+
     def __init__(self):
-        self.base_urls = SMART_HOME_BASE_URLS
-        self.timeout = SMART_HOME_TIMEOUT_SEC
-        self.active_base_url: Optional[str] = None
-        self.session = requests.Session()
+        self.ha = HomeAssistantClient(
+            base_url=HOME_ASSISTANT_URL,
+            token=HOME_ASSISTANT_TOKEN,
+            timeout=HOME_ASSISTANT_TIMEOUT_SEC,
+            entities=HOME_ASSISTANT_ENTITIES,
+        )
+
+        self.relay = RelayHttpClient(
+            base_urls=RELAY_HOME_BASE_URLS,
+            timeout=RELAY_HTTP_TIMEOUT_SEC,
+        )
+
+        self.active_backend = SmartHomeBackend.NONE
+
+        # Kept for compatibility with older /health code and older tests.
+        self.base_urls = self.relay.base_urls
+        self.active_base_url = self.relay.active_base_url
 
         self.devices = {
             "tv": {
                 "label": "TV",
                 "plural": False,
-                "on": "/sony/on",
-                "off": "/sony/off",
-                "toggle": "/sony/toggle",
+                "entity_id": HOME_ASSISTANT_ENTITIES["tv"],
             },
             "soundbar": {
                 "label": "Soundbar",
                 "plural": False,
-                "on": "/sb/on",
-                "off": "/sb/off",
-                "toggle": "/sb/toggle",
+                "entity_id": HOME_ASSISTANT_ENTITIES["soundbar"],
             },
             "subwoofer": {
                 "label": "Subwoofer",
                 "plural": False,
-                "on": "/sub/on",
-                "off": "/sub/off",
-                "toggle": "/sub/toggle",
+                "entity_id": HOME_ASSISTANT_ENTITIES["subwoofer"],
             },
             "rear": {
                 "label": "Rear speakers",
                 "plural": True,
-                "on": "/rear/on",
-                "off": "/rear/off",
-                "toggle": "/rear/toggle",
+                "entity_id": HOME_ASSISTANT_ENTITIES["rear"],
             },
         }
 
         logger.info(
-            "Smart home engine ready — relay URLs: "
-            + ", ".join(self.base_urls)
+            "Smart home engine ready — HA=%s Relay=%s",
+            HOME_ASSISTANT_URL,
+            ", ".join(RELAY_HOME_BASE_URLS),
         )
 
-    def handle_intent(self, routed: RoutedIntent) -> SmartHomeResult:
-        """
-        Executes a routed smart-home intent.
+    # ── Public API ─────────────────────────────────
 
-        Safety rule:
-        Low-confidence control commands are not executed.
-        """
+    def handle_intent(self, routed: RoutedIntent) -> SmartHomeResult:
         if routed.domain != "smart_home":
             return SmartHomeResult(False, "")
 
@@ -82,293 +102,313 @@ class SmartHomeEngine:
             return SmartHomeResult(
                 True,
                 "I heard a device command, but I could not parse it safely.",
-                action="clarify",
-                devices=routed.devices,
             )
 
         if routed.intent == "status":
             return self._handle_status(routed.devices)
 
         if routed.intent == "control":
-            if routed.confidence < 0.75:
-                return SmartHomeResult(
-                    True,
-                    "I heard a device command, but I am not confident enough to execute it.",
-                    action="clarify",
-                    devices=routed.devices,
-                )
-
-            return self._execute_command_batch(routed.commands)
+            return self._handle_control(routed)
 
         return SmartHomeResult(False, "")
 
-    def _expand_devices(self, devices: list[str]) -> list[str]:
-        all_devices = ["tv", "soundbar", "subwoofer", "rear"]
+    def get_status(self) -> Optional[dict[str, Optional[bool]]]:
+        """
+        Return current status from best available backend.
 
-        if not devices:
-            return all_devices
+        HA is preferred.
+        Relay home IP is fallback.
+        """
+        ha_status = self.ha.get_status()
 
-        # ["all"] alone means every device.
-        if devices == ["all"]:
-            return all_devices
+        if ha_status is not None:
+            self.active_backend = SmartHomeBackend.HOME_ASSISTANT
+            return ha_status
 
-        # Safety guard:
-        # If "all" appears mixed with explicit devices, ignore "all".
-        # This prevents mistakes like:
-        # ["soundbar", "subwoofer", "rear", "all"]
-        # from accidentally controlling the TV.
-        if "all" in devices:
-            logger.warning(
-                f"Ignoring mixed 'all' device entry for safety: {devices}"
+        relay_status = self.relay.get_status()
+
+        if relay_status is not None:
+            self.active_backend = SmartHomeBackend.RELAY_HOME
+            self.active_base_url = self.relay.active_base_url
+            return relay_status
+
+        self.active_backend = SmartHomeBackend.NONE
+        return None
+
+    def health_snapshot(self) -> dict:
+        ha_available = self.ha.is_available()
+        relay_status = self.relay.get_status()
+        relay_available = relay_status is not None
+
+        self.active_base_url = self.relay.active_base_url
+
+        if ha_available:
+            preferred_mode = "online_intelligent_ha"
+        elif relay_available:
+            preferred_mode = "online_intelligent_relay"
+        else:
+            preferred_mode = "smart_home_unavailable"
+
+        return {
+            "preferred_mode": preferred_mode,
+            "active_backend": self.active_backend.value,
+            "home_assistant": {
+                "url": self.ha.base_url,
+                "configured": self.ha.configured,
+                "available": ha_available,
+                "entities": dict(self.ha.entities),
+            },
+            "relay_home": {
+                "configured_urls": self.relay.base_urls,
+                "active_url": self.relay.active_base_url,
+                "available": relay_available,
+            },
+        }
+
+    # ── Control handling ───────────────────────────
+
+    def _handle_control(self, routed: RoutedIntent) -> SmartHomeResult:
+        commands = self._commands_from_routed_intent(routed)
+
+        if not commands:
+            return SmartHomeResult(
+                True,
+                "I understood it as a smart-home command, but no valid device was found.",
             )
-            devices = [
-                device
-                for device in devices
-                if device != "all"
+
+        # Mode 1: try Home Assistant first.
+        if self.ha.get_status() is not None:
+            if self._execute_commands_on_backend(
+                backend=SmartHomeBackend.HOME_ASSISTANT,
+                commands=commands,
+            ):
+                self.active_backend = SmartHomeBackend.HOME_ASSISTANT
+                return SmartHomeResult(
+                    True,
+                    self._control_success_response(commands),
+                    action=commands[0].action,
+                    devices=commands[0].devices,
+                    backend=self.active_backend.value,
+                )
+
+            logger.warning("Home Assistant command path failed. Trying relay fallback.")
+
+        # Mode 2: fallback to ESP8266 home IP.
+        if self._execute_commands_on_backend(
+            backend=SmartHomeBackend.RELAY_HOME,
+            commands=commands,
+        ):
+            self.active_backend = SmartHomeBackend.RELAY_HOME
+            self.active_base_url = self.relay.active_base_url
+
+            return SmartHomeResult(
+                True,
+                self._control_success_response(
+                    commands,
+                    fallback=True,
+                ),
+                action=commands[0].action,
+                devices=commands[0].devices,
+                backend=self.active_backend.value,
+            )
+
+        self.active_backend = SmartHomeBackend.NONE
+
+        return SmartHomeResult(
+            True,
+            "I understood the device command, but Home Assistant and the relay board are both unreachable.",
+            action=commands[0].action,
+            devices=commands[0].devices,
+            backend=self.active_backend.value,
+        )
+
+    def _execute_commands_on_backend(
+        self,
+        backend: SmartHomeBackend,
+        commands: list[RoutedCommand],
+    ) -> bool:
+        for command in commands:
+            devices = self._expand_devices(command.devices)
+
+            for device in devices:
+                if backend == SmartHomeBackend.HOME_ASSISTANT:
+                    ok = self.ha.set_device(device, command.action)
+                elif backend == SmartHomeBackend.RELAY_HOME:
+                    ok = self.relay.set_device(device, command.action)
+                else:
+                    ok = False
+
+                if not ok:
+                    logger.error(
+                        "Smart-home command failed on %s: %s %s",
+                        backend.value,
+                        device,
+                        command.action,
+                    )
+                    return False
+
+        return True
+
+    def _commands_from_routed_intent(
+        self,
+        routed: RoutedIntent,
+    ) -> list[RoutedCommand]:
+        commands = list(routed.commands or [])
+
+        if not commands and routed.action and routed.devices:
+            commands = [
+                RoutedCommand(
+                    action=routed.action,
+                    devices=routed.devices,
+                )
             ]
 
-        expanded = []
+        clean_commands: list[RoutedCommand] = []
 
-        for device in devices:
-            if device in self.devices and device not in expanded:
-                expanded.append(device)
+        for command in commands:
+            if command.action not in {"on", "off", "toggle"}:
+                continue
 
-        return expanded
+            devices = self._expand_devices(command.devices)
 
-    def _handle_status(self, devices: list[str]) -> SmartHomeResult:
+            if not devices:
+                continue
+
+            clean_commands.append(
+                RoutedCommand(
+                    action=command.action,
+                    devices=devices,
+                )
+            )
+
+        return clean_commands
+
+    # ── Status handling ────────────────────────────
+
+    def _handle_status(self, requested_devices: list[str]) -> SmartHomeResult:
         status = self.get_status()
 
         if status is None:
             return SmartHomeResult(
                 True,
-                "I could not reach the smart extension board.",
-                action="status",
-                devices=devices,
+                "I could not read the smart-home status. Home Assistant and the relay board are both unreachable.",
+                backend=SmartHomeBackend.NONE.value,
             )
 
-        expanded = self._expand_devices(devices)
-
-        if not devices or "all" in devices:
-            response = self._format_full_status(status)
-        else:
-            response = self._format_specific_status(status, expanded)
+        devices = self._expand_devices(requested_devices or ["all"])
+        response = self._status_response(status, devices)
 
         return SmartHomeResult(
             True,
             response,
             action="status",
-            devices=expanded,
+            devices=devices,
+            backend=self.active_backend.value,
         )
 
-    def _execute_command_batch(
+    def _status_response(
         self,
-        commands: list[RoutedCommand],
-    ) -> SmartHomeResult:
-        if not commands:
-            return SmartHomeResult(
-                True,
-                "I understood a command, but not the device action.",
-                action="clarify",
-                devices=[],
-            )
-
-        executed_groups = []
-        failed_devices = []
-
-        for command in commands:
-            action = command.action
-            devices = self._expand_devices(command.devices)
-
-            for device_id in devices:
-                endpoint = self.devices[device_id][action]
-
-                if self._get(endpoint) is not None:
-                    executed_groups.append((action, device_id))
-                else:
-                    failed_devices.append(device_id)
-
-        if not executed_groups and failed_devices:
-            return SmartHomeResult(
-                True,
-                "I could not reach the smart extension board.",
-                action="batch",
-                devices=failed_devices,
-            )
-
-        status = self.get_status()
-
-        if status is None:
-            return SmartHomeResult(
-                True,
-                "Command sent, but I could not verify the device state.",
-                action="batch",
-                devices=[device for _, device in executed_groups],
-            )
-
-        if failed_devices:
-            fail_names = self._format_device_list(failed_devices)
-            return SmartHomeResult(
-                True,
-                f"Some devices changed, but {fail_names} failed.",
-                action="batch",
-                devices=[device for _, device in executed_groups],
-            )
-
-        response = self._format_batch_confirmation(commands, status)
-
-        return SmartHomeResult(
-            True,
-            response,
-            action="batch",
-            devices=[device for _, device in executed_groups],
-        )
-
-    def _get(self, endpoint: str) -> Optional[str]:
-        urls_to_try = []
-
-        if self.active_base_url:
-            urls_to_try.append(self.active_base_url)
-
-        for url in self.base_urls:
-            if url not in urls_to_try:
-                urls_to_try.append(url)
-
-        for base_url in urls_to_try:
-            full_url = base_url + endpoint
-
-            try:
-                logger.info(f"Smart home GET: {full_url}")
-
-                response = self.session.get(
-                    full_url,
-                    timeout=self.timeout,
-                )
-
-                if response.status_code == 200:
-                    self.active_base_url = base_url
-                    return response.text.strip()
-
-                logger.warning(
-                    f"Smart home HTTP {response.status_code}: {full_url}"
-                )
-
-            except requests.RequestException as e:
-                logger.warning(f"Smart home request failed: {full_url}: {e}")
-
-        return None
-
-    def get_status(self) -> Optional[dict[str, bool]]:
-        payload = self._get("/status")
-
-        if payload is None:
-            return None
-
-        return self._parse_status(payload)
-
-    def _parse_status(self, payload: str) -> Optional[dict[str, bool]]:
-        payload = payload.strip()
-        parts = [p.strip() for p in payload.split(",")]
-
-        if len(parts) != 4:
-            logger.error(f"Invalid relay status payload: '{payload}'")
-            return None
-
-        if any(part not in {"0", "1"} for part in parts):
-            logger.error(f"Invalid relay status tokens: '{payload}'")
-            return None
-
-        return {
-            "tv": parts[0] == "1",
-            "soundbar": parts[1] == "1",
-            "subwoofer": parts[2] == "1",
-            "rear": parts[3] == "1",
-        }
-
-    def _format_batch_confirmation(
-        self,
-        commands: list[RoutedCommand],
-        status: dict[str, bool],
-    ) -> str:
-        parts = []
-
-        for command in commands:
-            action = command.action
-            devices = self._expand_devices(command.devices)
-
-            if action == "toggle":
-                parts.append(self._format_specific_status(status, devices))
-                continue
-
-            desired_state = action == "on"
-
-            confirmed = [
-                device_id
-                for device_id in devices
-                if status.get(device_id) == desired_state
-            ]
-
-            not_confirmed = [
-                device_id
-                for device_id in devices
-                if status.get(device_id) != desired_state
-            ]
-
-            if confirmed:
-                names = self._format_device_list(confirmed)
-
-                if len(confirmed) == 1:
-                    verb = "are" if self.devices[confirmed[0]]["plural"] else "is"
-                    parts.append(f"{names} {verb} {action}")
-                else:
-                    parts.append(f"{names} are {action}")
-
-            if not_confirmed:
-                names = self._format_device_list(not_confirmed)
-                parts.append(f"{names} did not confirm")
-
-        if not parts:
-            return "Command sent, but the state did not change."
-
-        return ". ".join(parts) + "."
-
-    def _format_specific_status(
-        self,
-        status: dict[str, bool],
+        status: dict[str, Optional[bool]],
         devices: list[str],
     ) -> str:
-        parts = []
+        if not devices:
+            devices = list(self.DEVICE_ORDER)
 
-        for device_id in devices:
-            label = self.devices[device_id]["label"]
-            state = "on" if status.get(device_id) else "off"
-            verb = "are" if self.devices[device_id]["plural"] else "is"
-            parts.append(f"{label} {verb} {state}")
-
-        return self._join_sentence_parts(parts) + "."
-
-    def _format_full_status(self, status: dict[str, bool]) -> str:
-        on_devices = [
-            device_id
-            for device_id, is_on in status.items()
-            if is_on
+        unknown_devices = [
+            device for device in devices
+            if status.get(device) is None
         ]
 
-        if not on_devices:
-            return "Everything is off."
+        on_devices = [
+            device for device in devices
+            if status.get(device) is True
+        ]
 
-        if len(on_devices) == len(self.devices):
-            return "Everything is on."
+        off_devices = [
+            device for device in devices
+            if status.get(device) is False
+        ]
 
-        names = self._format_device_list(on_devices)
+        if len(devices) == 1:
+            device = devices[0]
+            label = self.devices[device]["label"]
+            plural = self.devices[device]["plural"]
+            state = status.get(device)
 
-        if len(on_devices) == 1:
-            verb = "are" if self.devices[on_devices[0]]["plural"] else "is"
-            return f"{names} {verb} on."
+            if state is True:
+                verb = "are" if plural else "is"
+                return f"{label} {verb} on."
 
-        return f"{names} are on."
+            if state is False:
+                verb = "are" if plural else "is"
+                return f"{label} {verb} off."
+
+            return f"I could not read {label}."
+
+        if on_devices:
+            names = self._format_device_list(on_devices)
+            base = f"{names} are on."
+        else:
+            base = "All devices are off."
+
+        if off_devices and on_devices:
+            off_names = self._format_device_list(off_devices)
+            base += f" {off_names} are off."
+
+        if unknown_devices:
+            unknown_names = self._format_device_list(unknown_devices)
+            base += f" I could not read {unknown_names}."
+
+        return base
+
+    # ── Helpers ────────────────────────────────────
+
+    def _expand_devices(self, devices: list[str]) -> list[str]:
+        if not devices or "all" in devices:
+            return list(self.DEVICE_ORDER)
+
+        clean: list[str] = []
+
+        for device in devices:
+            if device in self.DEVICE_ORDER and device not in clean:
+                clean.append(device)
+
+        return clean
+
+    def _control_success_response(
+        self,
+        commands: list[RoutedCommand],
+        fallback: bool = False,
+    ) -> str:
+        parts: list[str] = []
+
+        for command in commands:
+            devices = self._expand_devices(command.devices)
+            names = self._format_device_list(devices)
+
+            if command.action == "on":
+                parts.append(f"turned on {names}")
+            elif command.action == "off":
+                parts.append(f"turned off {names}")
+            elif command.action == "toggle":
+                parts.append(f"toggled {names}")
+
+        if not parts:
+            return "Done."
+
+        response = "Done, I " + self._join_sentence_parts(parts) + "."
+
+        if fallback:
+            response += " Home Assistant was unavailable, so I used direct relay control."
+
+        return response
 
     def _format_device_list(self, device_ids: list[str]) -> str:
-        labels = [self.devices[device_id]["label"] for device_id in device_ids]
+        labels = [
+            self.devices[device_id]["label"]
+            for device_id in device_ids
+            if device_id in self.devices
+        ]
         return self._join_sentence_parts(labels)
 
     def _join_sentence_parts(self, parts: list[str]) -> str:
