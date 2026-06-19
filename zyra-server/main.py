@@ -1023,15 +1023,51 @@ async def zyra_websocket(websocket: WebSocket):
 
 
 # ── Health check ──────────────────────────────────
+
 @app.get("/health")
 async def health():
+    """
+    Fast server-only health check for ESP32.
+
+    Do not check Home Assistant or ESP8266 relay here.
+    This endpoint only tells firmware that the ZYRA server process is alive.
+    """
     return {
         "status": "online",
-        "model": llm.model,
-        "memory": "connected",
-        "smart_home": smart_home.health_snapshot(),
+        "server": "zyra"
     }
 
+
+@app.get("/smart-home/health")
+async def smart_home_health():
+    """
+    Detailed smart-home health check.
+
+    This is for manual debugging only.
+    ESP32 firmware should not use this endpoint for server liveness.
+    """
+    loop = asyncio.get_running_loop()
+
+    try:
+        snapshot = await asyncio.wait_for(
+            loop.run_in_executor(None, smart_home.health_snapshot),
+            timeout=3.0,
+        )
+
+        return snapshot
+
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "error": "smart-home health timed out",
+            "note": "Zyra server is alive, but HA/relay backend check is slow or unavailable.",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
 # ── Run server ────────────────────────────────────
 if __name__ == "__main__":

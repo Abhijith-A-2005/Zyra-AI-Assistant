@@ -26,7 +26,7 @@
 #include "audio_pipeline.h"
 #include "websocket_client.h"
 #include "display.h"
-#include "offline_relay.h"
+#include "smart_home_control.h"
 #include "status_led.h"
 
 #define CAPTURE_SAMPLE_RATE 16000
@@ -48,7 +48,7 @@ static esp_netif_t* s_sta_netif = NULL;
 #define OFFLINE_AP_RETRY_DELAY_MS       1200
 
 #define SERVER_HEALTH_INTERVAL_MS   5000
-#define SERVER_HEALTH_TIMEOUT_MS    1500
+#define SERVER_HEALTH_TIMEOUT_MS    5000
 #define SERVER_HEALTH_FAIL_LIMIT    2
 
 static volatile bool s_switching_wifi = false;
@@ -56,25 +56,28 @@ static volatile bool s_switching_wifi = false;
 // This means: server is unavailable, so online voice mode pauses.
 static volatile bool s_offline_mode = false;
 
-// This means: offline relay control is happening through home Wi-Fi.
+// This means: relay control is happening through home Wi-Fi.
 static volatile bool s_home_relay_mode = false;
 
-// This means: offline relay control is happening through ESP-REMOTE-DIRECT.
+// This means: emergency relay control is happening through ESP-REMOTE-DIRECT.
 static volatile bool s_relay_ap_mode = false;
 
 static volatile bool s_force_runtime_fallback = false;
 static volatile bool s_force_direct_ap_fallback = false;
 static volatile bool s_relay_error_active = false;
 static volatile bool s_online_voice_paused = false;
+static volatile bool s_home_relay_starting = false;
+// True while an online wake/capture/send/response cycle is active.
+static volatile bool s_online_interaction_active = false;
 static int s_relay_fail_count = 0;
 static int s_relay_ok_count = 0;
 
 static TaskHandle_t s_runtime_fallback_task_handle = NULL;
 static TaskHandle_t s_server_reconnect_task_handle = NULL;
-static TaskHandle_t s_offline_relay_task_handle = NULL;
+static TaskHandle_t s_smart_home_control_task_handle = NULL;
 static TaskHandle_t s_zyra_task_handle = NULL;
 
-static void offline_relay_task(void* arg);
+static void smart_home_control_task(void* arg);
 static void zyra_task(void* param);
 static bool start_offline_mode(const char* reason);
 static bool start_home_relay_mode(const char* reason);
@@ -170,16 +173,16 @@ static void show_offline_status_on_display(void) {
         line1,
         sizeof(line1),
         "TV:%s SB:%s",
-        offline_relay_get_state(OFFLINE_DEVICE_TV) ? "ON" : "OFF",
-        offline_relay_get_state(OFFLINE_DEVICE_SOUNDBAR) ? "ON" : "OFF"
+        smart_home_control_get_state(SMART_HOME_DEVICE_TV) ? "ON" : "OFF",
+        smart_home_control_get_state(SMART_HOME_DEVICE_SOUNDBAR) ? "ON" : "OFF"
     );
 
     snprintf(
         line2,
         sizeof(line2),
         "SUB:%s REAR:%s",
-        offline_relay_get_state(OFFLINE_DEVICE_SUBWOOFER) ? "ON" : "OFF",
-        offline_relay_get_state(OFFLINE_DEVICE_REAR) ? "ON" : "OFF"
+        smart_home_control_get_state(SMART_HOME_DEVICE_SUBWOOFER) ? "ON" : "OFF",
+        smart_home_control_get_state(SMART_HOME_DEVICE_REAR) ? "ON" : "OFF"
     );
 
     display_show_message("OFFLINE STATUS", line1, line2);
@@ -188,10 +191,10 @@ static void show_offline_status_on_display(void) {
 static const char* offline_status_prompt_filename(void) {
     static char filename[24];
 
-    bool tv = offline_relay_get_state(OFFLINE_DEVICE_TV);
-    bool sb = offline_relay_get_state(OFFLINE_DEVICE_SOUNDBAR);
-    bool sub = offline_relay_get_state(OFFLINE_DEVICE_SUBWOOFER);
-    bool rear = offline_relay_get_state(OFFLINE_DEVICE_REAR);
+    bool tv = smart_home_control_get_state(SMART_HOME_DEVICE_TV);
+    bool sb = smart_home_control_get_state(SMART_HOME_DEVICE_SOUNDBAR);
+    bool sub = smart_home_control_get_state(SMART_HOME_DEVICE_SUBWOOFER);
+    bool rear = smart_home_control_get_state(SMART_HOME_DEVICE_REAR);
 
     snprintf(
         filename,
@@ -487,8 +490,8 @@ static void configure_offline_static_ip(void) {
     ESP_LOGI(TAG, "Serverless static IP configured: 192.168.4.50");
 }
 
-static bool wifi_connect_offline_relay_ap(void) {
-    ESP_LOGW(TAG, "Switching to offline relay AP");
+static bool wifi_connect_emergency_relay_ap(void) {
+    ESP_LOGW(TAG, "Switching to emergency relay AP");
 
     s_switching_wifi = true;
     s_offline_mode   = true;
@@ -585,7 +588,7 @@ static bool wifi_connect_offline_relay_ap(void) {
         if (bits & WIFI_CONNECTED_BIT) {
             s_switching_wifi = false;
 
-            ESP_LOGI(TAG, "Connected to offline relay AP");
+            ESP_LOGI(TAG, "Connected to emergency relay AP");
             set_state(DISP_OFFLINE);
             return true;
         }
@@ -705,7 +708,11 @@ static void server_health_task(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(SERVER_HEALTH_INTERVAL_MS));
 
         // Health monitor is only for online mode.
-        if (s_offline_mode || s_switching_wifi) {
+        if (s_offline_mode ||
+            s_switching_wifi ||
+            s_online_interaction_active ||
+            s_home_relay_starting) {
+
             fail_count = 0;
             continue;
         }
@@ -735,8 +742,10 @@ static void server_health_task(void* arg) {
 
             ESP_LOGE(TAG, "Server health monitor triggered fallback");
 
-            // Force = do not wait for WebSocket disconnect grace period.
-            request_runtime_offline_fallback(true);
+            // A /health timeout does not prove the WebSocket is dead.
+            // Only actual send failure should force fallback.
+            request_runtime_offline_fallback(false);
+
         }
     }
 }
@@ -791,103 +800,103 @@ static void handle_offline_voice_command(
 
     switch (command) {
         case OFFLINE_VOICE_CMD_TV_ON:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_TV,
-                OFFLINE_ACTION_ON
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_TV,
+                SMART_HOME_ACTION_ON
             );
             break;
 
         case OFFLINE_VOICE_CMD_TV_OFF:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_TV,
-                OFFLINE_ACTION_OFF
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_TV,
+                SMART_HOME_ACTION_OFF
             );
             break;
 
         case OFFLINE_VOICE_CMD_TV_TOGGLE:
-            ok = offline_relay_toggle_device(OFFLINE_DEVICE_TV);
+            ok = smart_home_control_toggle_device(SMART_HOME_DEVICE_TV);
             break;
 
         case OFFLINE_VOICE_CMD_SOUNDBAR_ON:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_SOUNDBAR,
-                OFFLINE_ACTION_ON
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_SOUNDBAR,
+                SMART_HOME_ACTION_ON
             );
             break;
 
         case OFFLINE_VOICE_CMD_SOUNDBAR_OFF:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_SOUNDBAR,
-                OFFLINE_ACTION_OFF
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_SOUNDBAR,
+                SMART_HOME_ACTION_OFF
             );
             break;
 
         case OFFLINE_VOICE_CMD_SOUNDBAR_TOGGLE:
-            ok = offline_relay_toggle_device(OFFLINE_DEVICE_SOUNDBAR);
+            ok = smart_home_control_toggle_device(SMART_HOME_DEVICE_SOUNDBAR);
             break;
 
         case OFFLINE_VOICE_CMD_SUBWOOFER_ON:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_SUBWOOFER,
-                OFFLINE_ACTION_ON
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_SUBWOOFER,
+                SMART_HOME_ACTION_ON
             );
             break;
 
         case OFFLINE_VOICE_CMD_SUBWOOFER_OFF:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_SUBWOOFER,
-                OFFLINE_ACTION_OFF
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_SUBWOOFER,
+                SMART_HOME_ACTION_OFF
             );
             break;
 
         case OFFLINE_VOICE_CMD_SUBWOOFER_TOGGLE:
-            ok = offline_relay_toggle_device(OFFLINE_DEVICE_SUBWOOFER);
+            ok = smart_home_control_toggle_device(SMART_HOME_DEVICE_SUBWOOFER);
             break;
 
         case OFFLINE_VOICE_CMD_REAR_ON:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_REAR,
-                OFFLINE_ACTION_ON
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_REAR,
+                SMART_HOME_ACTION_ON
             );
             break;
 
         case OFFLINE_VOICE_CMD_REAR_OFF:
-            ok = offline_relay_set_device(
-                OFFLINE_DEVICE_REAR,
-                OFFLINE_ACTION_OFF
+            ok = smart_home_control_set_device(
+                SMART_HOME_DEVICE_REAR,
+                SMART_HOME_ACTION_OFF
             );
             break;
 
         case OFFLINE_VOICE_CMD_REAR_TOGGLE:
-            ok = offline_relay_toggle_device(OFFLINE_DEVICE_REAR);
+            ok = smart_home_control_toggle_device(SMART_HOME_DEVICE_REAR);
             break;
 
         case OFFLINE_VOICE_CMD_SOUND_SYSTEM_ON:
-            ok = offline_relay_set_sound_system(OFFLINE_ACTION_ON);
+            ok = smart_home_control_set_sound_system(SMART_HOME_ACTION_ON);
             break;
 
         case OFFLINE_VOICE_CMD_SOUND_SYSTEM_OFF:
-            ok = offline_relay_set_sound_system(OFFLINE_ACTION_OFF);
+            ok = smart_home_control_set_sound_system(SMART_HOME_ACTION_OFF);
             break;
 
         case OFFLINE_VOICE_CMD_ALL_SPEAKERS_ON:
-            ok = offline_relay_set_all_speakers(OFFLINE_ACTION_ON);
+            ok = smart_home_control_set_all_speakers(SMART_HOME_ACTION_ON);
             break;
 
         case OFFLINE_VOICE_CMD_ALL_SPEAKERS_OFF:
-            ok = offline_relay_set_all_speakers(OFFLINE_ACTION_OFF);
+            ok = smart_home_control_set_all_speakers(SMART_HOME_ACTION_OFF);
             break;
 
         case OFFLINE_VOICE_CMD_HOME_THEATER_ON:
-            ok = offline_relay_set_home_theater(OFFLINE_ACTION_ON);
+            ok = smart_home_control_set_home_theater(SMART_HOME_ACTION_ON);
             break;
 
         case OFFLINE_VOICE_CMD_HOME_THEATER_OFF:
-            ok = offline_relay_set_home_theater(OFFLINE_ACTION_OFF);
+            ok = smart_home_control_set_home_theater(SMART_HOME_ACTION_OFF);
             break;
 
         case OFFLINE_VOICE_CMD_STATUS:
-            ok = offline_relay_fetch_status();
+            ok = smart_home_control_fetch_status();
             break;
 
         default:
@@ -938,7 +947,7 @@ static bool start_offline_mode(const char* reason) {
         return true;
     }
 
-    ESP_LOGW(TAG, "Entering direct AP offline relay mode: %s", reason);
+    ESP_LOGW(TAG, "Entering direct AP emergency relay mode: %s", reason);
 
     // Direct offline AP mode owns the mic.
     s_offline_mode = true;
@@ -948,12 +957,12 @@ static bool start_offline_mode(const char* reason) {
 
     ws_client_stop();
 
-    offline_relay_set_base_url(RELAY_AP_BASE_URL);
+    smart_home_control_set_base_url(RELAY_AP_BASE_URL);
 
     // First connect to ESP8266 direct AP.
     // Do not start offline voice while Wi-Fi is switching.
-    if (!wifi_connect_offline_relay_ap()) {
-        ESP_LOGE(TAG, "Failed to enter direct AP offline relay mode");
+    if (!wifi_connect_emergency_relay_ap()) {
+        ESP_LOGE(TAG, "Failed to enter direct AP emergency relay mode");
 
         s_relay_ap_mode = false;
         s_offline_mode = false;
@@ -973,14 +982,14 @@ static bool start_offline_mode(const char* reason) {
     drain_mic_frames(12);
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    if (s_offline_relay_task_handle == NULL) {
+    if (s_smart_home_control_task_handle == NULL) {
         xTaskCreatePinnedToCore(
-            offline_relay_task,
-            "OfflineRelay",
+            smart_home_control_task,
+            "SmartHome",
             4096,
             NULL,
             4,
-            &s_offline_relay_task_handle,
+            &s_smart_home_control_task_handle,
             0
         );
     }
@@ -989,7 +998,7 @@ static bool start_offline_mode(const char* reason) {
     offline_voice_set_ui_callback(handle_offline_voice_ui);
     offline_voice_start(handle_offline_voice_command);
 
-    ESP_LOGI(TAG, "ZYRA switched to direct AP offline relay mode");
+    ESP_LOGI(TAG, "ZYRA switched to direct AP emergency relay mode");
     return true;
 }
 
@@ -1000,6 +1009,7 @@ static bool start_home_relay_mode(const char* reason) {
     }
 
     ESP_LOGW(TAG, "Entering serverless mode: %s", reason);
+    s_home_relay_starting = true;   
 
     s_offline_mode = true;
     s_home_relay_mode = true;
@@ -1009,15 +1019,16 @@ static bool start_home_relay_mode(const char* reason) {
     // Stop WebSocket only. Do NOT disconnect home Wi-Fi.
     ws_client_stop();
 
-    offline_relay_set_base_url(RELAY_HOME_BASE_URL);
-    offline_relay_init();
+    smart_home_control_set_base_url(RELAY_HOME_BASE_URL);
+    smart_home_control_init();
 
     // Confirm ESP8266 is reachable on home Wi-Fi.
-    if (!offline_relay_fetch_status()) {
+    if (!smart_home_control_fetch_status()) {
         ESP_LOGW(TAG, "Home relay IP not reachable. Falling back to offline mode.");
 
         s_home_relay_mode = false;
         s_offline_mode = false;
+        s_home_relay_starting = false;
 
         return start_offline_mode("home relay unavailable");
     }
@@ -1027,20 +1038,36 @@ static bool start_home_relay_mode(const char* reason) {
     // Show SERVERLESS / LOCAL MODE before starting offline voice then idle.
     show_transition_state(DISP_SERVERLESS, 2200);
 
-    if (s_offline_relay_task_handle == NULL) {
+    if (!s_offline_mode ||
+        !s_home_relay_mode ||
+        s_relay_ap_mode ||
+        ws_is_connected()) {
+
+        ESP_LOGW(
+            TAG,
+            "Serverless startup cancelled because online mode is active again"
+        );
+
+        s_home_relay_starting = false;
+        return true;
+    }
+
+    if (s_smart_home_control_task_handle == NULL) {
         xTaskCreatePinnedToCore(
-            offline_relay_task,
-            "OfflineRelay",
+            smart_home_control_task,
+            "SmartHome",
             4096,
             NULL,
             4,
-            &s_offline_relay_task_handle,
+            &s_smart_home_control_task_handle,
             0
         );
     }
 
     offline_voice_set_ui_callback(handle_offline_voice_ui);
     offline_voice_start(handle_offline_voice_command);
+
+    s_home_relay_starting = false;
 
     ESP_LOGI(TAG, "ZYRA switched to serverless mode");
     return true;
@@ -1122,7 +1149,7 @@ static void server_reconnect_task(void* arg) {
             continue;
         }
 
-        if (s_switching_wifi) {
+        if (s_switching_wifi || s_home_relay_starting || s_online_interaction_active) {
             continue;
         }
 
@@ -1412,6 +1439,7 @@ static void zyra_task(void* param) {
 
         // ── PHASE 3: Send to server ────────────────
         set_state(DISP_PROCESSING);
+        s_online_interaction_active = true;
         ESP_LOGI(TAG, "Sending %zu bytes (%dms of audio) to server",
                  captured,
                  (int)((captured / 2) * 1000 / CAPTURE_SAMPLE_RATE));
@@ -1419,6 +1447,9 @@ static void zyra_task(void* param) {
         esp_err_t err = ws_send_audio(capture_buf, captured);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Send failed — server may be offline");
+
+            s_online_interaction_active = false;
+
             request_runtime_offline_fallback(true);
             set_state(DISP_OFFLINE);
             continue;
@@ -1437,6 +1468,7 @@ static void zyra_task(void* param) {
             while (!ws_response_ready() && timeout < 1200) {
                 if (!ws_is_connected()) {
                     ESP_LOGE(TAG, "Server disconnected while waiting for response");
+                    s_online_interaction_active = false;
                     request_runtime_offline_fallback(true);
                     break;
                 }
@@ -1447,6 +1479,8 @@ static void zyra_task(void* param) {
 
             if (!ws_response_ready()) {
                 ESP_LOGW(TAG, "Response chunk timeout");
+
+                s_online_interaction_active = false;
 
                 if (!ws_is_connected()) {
                     set_state(DISP_OFFLINE);
@@ -1510,6 +1544,8 @@ static void zyra_task(void* param) {
             }
         }
 
+        s_online_interaction_active = false; 
+
         // Give speaker output time to settle before listening again.
         vTaskDelay(pdMS_TO_TICKS(VAD_POST_SPEAK_COOLDOWN_MS));
 
@@ -1559,12 +1595,12 @@ static void handle_offline_voice_ui(
     }
 }
 
-static void offline_relay_task(void* param) {
+static void smart_home_control_task(void* param) {
     ESP_LOGI(TAG, "Offline relay task started");
 
-    offline_relay_init();
+    smart_home_control_init();
 
-    if (offline_relay_fetch_status()) {
+    if (smart_home_control_fetch_status()) {
         ESP_LOGI(TAG, "Offline relay status synced");
 
         s_relay_error_active = false;
@@ -1590,12 +1626,12 @@ static void offline_relay_task(void* param) {
 
         if (!s_offline_mode) {
             ESP_LOGI(TAG, "Offline relay task stopping because online mode returned");
-            s_offline_relay_task_handle = NULL;
+            s_smart_home_control_task_handle = NULL;
             vTaskDelete(NULL);
             return;
         }
 
-        bool relay_ok = offline_relay_fetch_status();
+        bool relay_ok = smart_home_control_fetch_status();
 
         if (!relay_ok) {
             s_relay_ok_count = 0;
@@ -1670,7 +1706,7 @@ void app_main(void) {
         offline_speech_init();
 
         if (start_offline_mode("home WiFi unavailable during boot")) {
-            ESP_LOGI(TAG, "ZYRA direct AP offline relay mode active");
+            ESP_LOGI(TAG, "ZYRA direct AP emergency relay mode active");
             return;
         }
 

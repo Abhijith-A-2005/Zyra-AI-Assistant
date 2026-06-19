@@ -4,7 +4,7 @@ idf_component_register(
         "audio_pipeline.c"
         "websocket_client.c"
         "display.c"
-        "offline_relay.c"
+        "smart_home_control.c"
         "offline_voice.c"
         "offline_speech.c"
         "wakeword_engine.c"

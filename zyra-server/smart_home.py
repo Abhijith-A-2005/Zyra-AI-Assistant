@@ -137,8 +137,7 @@ class SmartHomeEngine:
 
     def health_snapshot(self) -> dict:
         ha_available = self.ha.is_available()
-        relay_status = self.relay.get_status()
-        relay_available = relay_status is not None
+        relay_available = self.relay.is_available()
 
         self.active_base_url = self.relay.active_base_url
 

@@ -255,6 +255,7 @@ esp_err_t ws_client_init(const char* server_ip,
     esp_websocket_client_config_t cfg = {
         .uri                  = uri,
         .reconnect_timeout_ms = 3000,
+        .network_timeout_ms   = 15000,
         .ping_interval_sec    = 15,
         .transport            = WEBSOCKET_TRANSPORT_OVER_TCP,
     };
@@ -330,11 +331,20 @@ esp_err_t ws_send_audio(const uint8_t* data,
     xSemaphoreGive(response_mutex);
 
     int sent = esp_websocket_client_send_bin(
-        client, (const char*)data, len,
-        pdMS_TO_TICKS(5000)
+        client,
+        (const char*)data,
+        len,
+        pdMS_TO_TICKS(15000)
     );
 
-    return sent >= 0 ? ESP_OK : ESP_FAIL;
+    if (sent != (int)len) {
+        ESP_LOGE(TAG, "WebSocket audio send incomplete: sent=%d expected=%u",
+                sent,
+                (unsigned int)len);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 bool ws_response_ready(void) {

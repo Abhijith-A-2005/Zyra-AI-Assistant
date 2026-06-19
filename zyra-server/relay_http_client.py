@@ -107,9 +107,6 @@ class RelayHttpClient:
 
         return None
 
-    def is_available(self) -> bool:
-        return self.get_status() is not None
-
     def _parse_status(self, payload: str) -> Optional[dict[str, bool]]:
         if not payload:
             return None
@@ -154,9 +151,35 @@ class RelayHttpClient:
 
         return payload.strip().lower() == "pong"
 
+    def ping_fast(self) -> bool:
+        """
+        Fast relay availability check.
+
+        Used only for health/status decisions.
+        """
+        for base_url in self._candidate_urls():
+            url = f"{base_url}/ping"
+
+            try:
+                logger.info("Relay fast ping: %s", url)
+
+                response = self.session.get(
+                    url,
+                    timeout=min(self.timeout, 0.6),
+                )
+
+                if response.status_code == 200 and response.text.strip().lower() == "pong":
+                    self.active_base_url = base_url
+                    return True
+
+            except requests.RequestException as e:
+                logger.warning("Relay fast ping failed: %s: %s", url, e)
+
+        return False
+
 
     def is_available(self) -> bool:
-        return self.ping()
+        return self.ping_fast()
 
     def set_device(self, device: str, action: str) -> bool:
         if device not in self.DEVICE_ENDPOINTS:
