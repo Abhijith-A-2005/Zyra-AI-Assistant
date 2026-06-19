@@ -1,12 +1,12 @@
 # ZYRA
 
-ZYRA is a custom local smart home voice assistant built using an **ESP32-S3** and a **Python AI server**.
+ZYRA is a custom local smart-home voice assistant built using an **ESP32-S3** and a **Python AI server**.
 
-The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Kokoro TTS with the af_heart voice, and plays them back through a MAX98357 I2S amplifier.
+The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Kokoro TTS with the `af_heart` voice, and plays them back through a MAX98357 I2S amplifier.
 
 The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, provide RGB LED feedback, wake through a local hardware wakeword, and intelligently understand smart-home commands such as turning devices on, turning devices off, checking device status, and controlling grouped home-theater devices without depending on cloud assistants.
 
-The physical relay board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, RGB status LED feedback, and offline relay connectivity support.
+The physical relay-board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, RGB status LED feedback, and serverless relay fallback support.
 
 ---
 
@@ -21,18 +21,21 @@ ZYRA/
 │   ├── .env.example
 │   ├── audio_utils.py
 │   ├── config.py
+│   ├── home_assistant_client.py
 │   ├── intent_router.py
 │   ├── llm.py
 │   ├── main.py
 │   ├── memory.py
+│   ├── relay_http_client.py
 │   ├── requirements.txt
 │   ├── smart_home.py
+│   ├── smart_home_backends.py
 │   ├── stt.py
 │   ├── test_components.py
+│   ├── test_home_assistant.py
 │   ├── test_tts_api.py
 │   ├── test_websocket.py
-│   ├── tts.py
-│   
+│   └── tts.py
 │
 └── zyra-firmware/
     ├── .gitignore
@@ -82,12 +85,12 @@ ZYRA/
         ├── display.h
         ├── idf_component.yml
         ├── main.c
-        ├── offline_relay.c
-        ├── offline_relay.h
         ├── offline_speech.c
         ├── offline_speech.h
         ├── offline_voice.c
         ├── offline_voice.h
+        ├── smart_home_control.c
+        ├── smart_home_control.h
         ├── status_led.c
         ├── status_led.h
         ├── wakeword_engine.c
@@ -112,76 +115,85 @@ It handles:
 * Text-to-speech using Kokoro TTS
 * Memory using ChromaDB and SQLite
 * Intent routing for assistant and smart-home commands
-* Smart-home command understanding
-* Local relay-board HTTP command forwarding
+* Home Assistant smart-home control
+* ESP8266 relay-board HTTP fallback control
 * WebSocket communication with the ESP32-S3
+* Fast `/health` server liveness check for firmware
+* Separate smart-home health checking for Home Assistant and relay fallback debugging
 
 Important files:
 
-| File                 | Purpose                                                                            |
-| -------------------- | ---------------------------------------------------------------------------------- |
-| `main.py`            | Starts the FastAPI WebSocket server and runs the main ZYRA pipeline                |
-| `config.py`          | Server, model, audio, memory, and smart-home configuration                         |
-| `intent_router.py`   | Routes transcripts into assistant chat or smart-home control intents               |
-| `smart_home.py`      | Handles smart-home command execution and forwards HTTP requests to the relay board |
-| `stt.py`             | Speech-to-text engine using Faster-Whisper with hallucination filtering            |
-| `llm.py`             | Ollama LLM engine with warmup and persistent model loading                         |
-| `tts.py`             | Kokoro text-to-speech engine                                                        |
-| `memory.py`          | ChromaDB and SQLite memory handling                                                |
-| `test_components.py` | Tests Ollama, Whisper, Kokoro, and memory                                           |
-| `test_tts_api.py`    | Tests Kokoro TTS behavior                                                           |
-| `test_websocket.py`  | Tests the WebSocket pipeline                                                       |
-| `.env.example`       | Example environment configuration                                                  |
-| `requirements.txt`   | Python dependencies                                                                |
+| File                       | Purpose                                                                                      |
+| -------------------------- | -------------------------------------------------------------------------------------------- |
+| `main.py`                  | Starts the FastAPI WebSocket server and runs the main ZYRA pipeline                          |
+| `config.py`                | Server, model, audio, memory, Home Assistant, and relay fallback configuration               |
+| `home_assistant_client.py` | Home Assistant REST client used for Online HA Mode                                           |
+| `relay_http_client.py`     | ESP8266 relay-board HTTP client used for Online Relay Mode fallback                          |
+| `smart_home_backends.py`   | Smart-home backend enums and result objects                                                  |
+| `smart_home.py`            | Smart-home engine that chooses Home Assistant first and relay fallback second                |
+| `intent_router.py`         | Routes transcripts into assistant chat or smart-home control/status intents                  |
+| `stt.py`                   | Speech-to-text engine using Faster-Whisper with silence and hallucination filtering          |
+| `llm.py`                   | Ollama LLM engine with warmup and persistent model loading                                   |
+| `tts.py`                   | Kokoro text-to-speech engine using the `af_heart` voice                                      |
+| `memory.py`                | ChromaDB and SQLite memory handling                                                          |
+| `test_components.py`       | Tests Ollama, Whisper, Kokoro TTS, and memory                                                |
+| `test_home_assistant.py`   | Tests Home Assistant and relay fallback backend availability                                 |
+| `test_tts_api.py`          | Generates a Kokoro TTS test WAV                                                              |
+| `test_websocket.py`        | Simulates the ESP32-S3 WebSocket client from the PC                                          |
 
----
+Current server-side smart-home modes:
+
+```text
+Mode 1 — Online HA Mode
+ESP32-S3 → ZYRA Server → Home Assistant → MQTT → ESP8266 relay board
+
+Mode 2 — Online Relay Mode
+ESP32-S3 → ZYRA Server → ESP8266 relay board home IP
+```
+
+Mode 1 is preferred when Home Assistant is available. Mode 2 is used automatically when the ZYRA server is online but Home Assistant is unavailable.
 
 ### `zyra-firmware/`
 
-The ESP32-S3 firmware.
+The ESP32-S3 firmware for the ZYRA physical assistant device.
 
 It handles:
 
 * Wi-Fi connection
-* Local Jarvis wakeword detection using ESP-SR WakeNet
 * WebSocket connection to the ZYRA server
-* Runtime detection of server disconnects
-* Automatic fallback to offline relay mode
-* Offline voice command recognition using ESP-SR MultiNet
-* Offline speech prompt playback from SPIFFS
-* Offline relay-board HTTP communication
+* INMP441 microphone input through I2S
+* MAX98357A speaker output through I2S
+* Wakeword detection using ESP-SR WakeNet
+* Limited serverless voice commands using ESP-SR MultiNet
+* OLED display feedback
 * RGB status LED feedback
-* INMP441 microphone input
-* MAX98357 speaker output
-* OLED display states
-* Audio capture and playback
-* PSRAM audio buffer allocation
+* Serverless relay fallback using the ESP8266 relay-board HTTP endpoints
+* Automatic return from serverless relay fallback to online mode when the ZYRA server is restored
+* SPIFFS WAV prompts for serverless/offline confirmations
 
 Important files:
 
-| File                         | Purpose                                                                                                  |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `main/main.c`                | Main ESP32-S3 firmware logic, online pipeline, Wi-Fi handling, wakeword flow, and offline fallback entry |
-| `main/audio_pipeline.c`      | I2S microphone and speaker pipeline                                                                      |
-| `main/audio_pipeline.h`      | Audio pipeline header                                                                                    |
-| `main/wakeword_engine.c`     | ESP-SR WakeNet wakeword engine for Jarvis detection                                                      |
-| `main/wakeword_engine.h`     | Wakeword engine API                                                                                      |
-| `main/offline_voice.c`       | ESP-SR MultiNet offline command recognizer                                                               |
-| `main/offline_voice.h`       | Offline voice command definitions and recognizer API                                                     |
-| `main/offline_speech.c`      | SPIFFS WAV prompt loader and offline prompt playback logic                                               |
-| `main/offline_speech.h`      | Offline speech prompt API                                                                                |
-| `main/offline_relay.c`       | Offline relay HTTP client, relay status sync, toggle, and group control logic                            |
-| `main/offline_relay.h`       | Offline relay device/action definitions and API                                                          |
-| `main/status_led.c`          | Onboard RGB LED status engine                                                                            |
-| `main/status_led.h`          | Status LED mode and state definitions                                                                    |
-| `main/websocket_client.c`    | ESP32 WebSocket client with disconnect callback and stop support                                         |
-| `main/websocket_client.h`    | WebSocket client header                                                                                  |
-| `main/display.c`             | OLED display handling, including wakeword, offline, relay, and speaking states                           |
-| `main/display.h`             | Display state definitions                                                                                |
-| `main/zyra_config.example.h` | Safe example Wi-Fi, server, and offline relay configuration                                              |
-| `spiffs/`                    | Offline WAV prompts used by the firmware                                                                 |
-| `partitions.csv`             | ESP32 flash partition layout for app, ESP-SR model partition, and SPIFFS storage                         |
-| `sdkconfig`                  | Working ESP-IDF project configuration                                                                    |
+| File                   | Purpose                                                                             |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| `main.c`               | Main firmware runtime flow, Wi-Fi, online/serverless switching, and UI integration  |
+| `audio_pipeline.c`     | I2S microphone input and I2S speaker output                                         |
+| `websocket_client.c`   | WebSocket client used to communicate with the ZYRA Python server                    |
+| `display.c`            | SSD1306 OLED display driver and UI states                                           |
+| `smart_home_control.c` | Firmware-side smart-home relay control module                                      |
+| `offline_voice.c`      | ESP-SR MultiNet limited local command recognizer                                    |
+| `offline_speech.c`     | SPIFFS WAV prompt playback for serverless/offline confirmations                     |
+| `wakeword_engine.c`    | ESP-SR WakeNet wakeword engine                                                      |
+| `status_led.c`         | Onboard RGB LED status feedback                                                     |
+| `zyra_config.example.h`| Safe template for private Wi-Fi, server, and relay settings                         |
+
+Current firmware-side smart-home fallback:
+
+```text
+Serverless Relay Fallback
+ESP32-S3 → ESP8266 relay board home IP
+```
+
+This mode is used when the ZYRA server path is unavailable. The firmware can continue limited relay control locally and later restore back to online mode when the server returns.
 
 ---
 
@@ -191,12 +203,20 @@ This version includes refinements to make ZYRA feel more stable and appliance-li
 
 Current refinements include:
 
+* Online HA Mode using Home Assistant as the preferred smart-home backend
+* Online Relay Mode when Home Assistant is unavailable but the ZYRA server is still online
+* Serverless Relay Fallback when the ZYRA server path is unavailable
+* Automatic restore from serverless relay fallback back to online mode when the server returns
+* Fast `/health` endpoint that checks only whether the ZYRA server is alive
+* Separate smart-home backend health/debug path so unavailable relays do not make the server look offline
+* Runtime guard to prevent health checks from forcing fallback during an active voice request
+* Runtime guard to prevent online and serverless voice loops from running at the same time
 * Improved wakeword flow
-* Improved offline voice listening flow
-* Better offline relay fallback behavior
+* Improved offline/serverless voice listening flow
+* Better relay fallback behavior using the cleaned `smart_home_control` firmware module
 * RGB LED mode/state feedback
 * OLED state feedback for online, serverless, offline, listening, thinking, speaking, and error states
-* SPIFFS-based prompt playback for offline relay confirmations
+* SPIFFS-based prompt playback for serverless relay confirmations
 * Jarvis-style Kokoro voice configuration support
 * Better STT rejection for silence, low-level noise, and common Whisper hallucinations
 * LLM warmup to reduce first-response cold-start delay
@@ -212,8 +232,8 @@ Mode colors:
 | Mode       | LED Color      | Meaning                                                          |
 | ---------- | -------------- | ---------------------------------------------------------------- |
 | Online     | Blue           | ESP32-S3 is connected to the ZYRA server                         |
-| Serverless | Purple         | Server path is unavailable but local fallback behavior is active |
-| Offline    | Amber / Orange | Offline relay mode is active                                     |
+| Serverless | Purple         | Server path is unavailable but local relay fallback is active     |
+| Offline    | Amber / Orange | Emergency offline relay/AP behavior is active                    |
 
 State colors:
 
@@ -275,7 +295,8 @@ Supported smart-home capabilities include:
 * Handling mixed commands
 * Handling exception commands
 * Checking device status
-* Controlling home-theater devices through a local relay board
+* Controlling home-theater devices through Home Assistant when available
+* Controlling home-theater devices directly through the ESP8266 relay board when Home Assistant is unavailable
 * Giving voice confirmation after the command is handled
 * Keeping smart-home control local through the home network
 
@@ -306,58 +327,58 @@ Jarvis, turn everything off
 Jarvis, power on the home theatre
 Jarvis, turn off the TV and turn on everything else
 Jarvis, turn on everything except TV
-Jarvis, which all devices are on?
+Jarvis, which devices are on?
 ```
 
-Typical online smart-home flow:
+Smart-home backend priority while the server is online:
 
 ```text
-Wakeword
-→ ESP32-S3 microphone
-→ ZYRA server
-→ Speech-to-text
-→ Intent router
-→ Smart-home command handler
-→ Local HTTP request to relay board
-→ Voice confirmation from ZYRA
+1. Home Assistant backend
+2. ESP8266 relay-board home IP fallback
 ```
 
-The relay-board firmware is not stored in this repository. It belongs in the separate Smart Extension / Smart-Switch-Board repository.
+Important behavior:
+
+```text
+Home Assistant unavailable does not mean the ESP32 must go offline.
+If the ZYRA server is still online, the server bypasses Home Assistant and controls the ESP8266 relay board directly.
+```
 
 ---
 
 ## Offline Relay Connectivity
 
-ZYRA includes firmware-side offline relay connectivity.
+ZYRA includes firmware-side serverless relay connectivity.
 
-This mode is designed for situations where the ESP32-S3 cannot reach the ZYRA Python server or the WebSocket connection drops during runtime. When that happens, the firmware can stop the WebSocket client and continue local relay control through the relay board.
+This mode is designed for situations where the ESP32-S3 cannot reach the ZYRA Python server or the WebSocket connection drops during runtime. When that happens, the firmware can stop the WebSocket client and continue limited local relay control through the ESP8266 relay board.
 
-Offline relay connectivity focuses on:
+Serverless relay connectivity focuses on:
 
 * Detecting WebSocket/server loss during online mode
 * Stopping the WebSocket client cleanly
-* Using relay-board HTTP endpoints directly
-* Switching to ESP-REMOTE-DIRECT AP when home Wi-Fi is unavailable
+* Using relay-board HTTP endpoints directly through the home Wi-Fi IP
 * Using relay status from `/status`
 * Tracking relay states for TV, soundbar, subwoofer, and rear speakers
-* Showing offline and relay status on the OLED display
+* Showing serverless/offline relay status on the OLED display
 * Updating RGB LED mode/state feedback
+* Automatically checking whether the ZYRA server has returned
+* Restoring online mode when the ZYRA server becomes available again
 
 Important note:
 
 ```text
-Offline relay connectivity does not mean the full AI assistant runs only on the ESP32-S3.
+Serverless relay connectivity does not mean the full AI assistant runs only on the ESP32-S3.
 
-The ZYRA Python server is still required for full speech-to-text, AI response generation, memory, and text-to-speech.
+The ZYRA Python server is still required for full speech-to-text, AI response generation, memory, and Kokoro text-to-speech.
 
-The offline relay firmware module provides local relay-board connectivity and relay-control functions when the server path is unavailable.
+The firmware-side smart_home_control module provides limited local relay-board control when the server path is unavailable.
 ```
 
 ---
 
 ## Offline Voice Commands
 
-ZYRA includes firmware-side offline voice command recognition.
+ZYRA includes firmware-side offline/serverless voice command recognition.
 
 This is a limited local fallback mode using ESP-SR MultiNet. It is meant for relay-control commands when the Python server is unavailable.
 
@@ -406,7 +427,7 @@ Full natural conversation, full STT, LLM reasoning, memory, and Kokoro TTS still
 
 ## Offline Speech Prompts
 
-The firmware uses SPIFFS WAV prompts for offline confirmations.
+The firmware uses SPIFFS WAV prompts for offline/serverless confirmations.
 
 Examples:
 
@@ -430,7 +451,7 @@ done.wav
 failed.wav
 ```
 
-The firmware also includes pre-generated status prompts:
+Status prompts are stored as bit-pattern files:
 
 ```text
 status_0000.wav
@@ -439,19 +460,39 @@ status_0001.wav
 status_1111.wav
 ```
 
-These represent all possible relay status combinations for:
+The bit order is:
 
 ```text
 TV, Soundbar, Subwoofer, Rear speakers
+```
+
+Example:
+
+```text
+status_1010.wav
+```
+
+means:
+
+```text
+TV on, Soundbar off, Subwoofer on, Rear speakers off
+```
+
+These prompt files are stored inside:
+
+```text
+zyra-firmware/spiffs/
 ```
 
 ---
 
 ## Offline Relay Endpoints
 
-The firmware offline relay module uses these relay-board endpoints:
+The ESP8266 relay board exposes local HTTP endpoints used by the server and firmware.
 
-| Device        | ON endpoint | OFF endpoint |
+Expected endpoints:
+
+| Device        | ON Endpoint | OFF Endpoint |
 | ------------- | ----------- | ------------ |
 | TV            | `/sony/on`  | `/sony/off`  |
 | Soundbar      | `/sb/on`    | `/sb/off`    |
@@ -464,39 +505,62 @@ Status endpoint:
 /status
 ```
 
-Expected status payload format:
-
-```text
-TV,SOUNDBAR,SUBWOOFER,REAR
-```
-
-Example:
+Expected status response format:
 
 ```text
 1,0,1,0
 ```
 
-Meaning:
+The order is:
 
 ```text
-TV ON
-Soundbar OFF
-Subwoofer ON
-Rear speakers OFF
+TV, Soundbar, Subwoofer, Rear speakers
+```
+
+Ping endpoint:
+
+```text
+/ping
+```
+
+Expected response:
+
+```text
+pong
+```
+
+Important note:
+
+```text
+/ping is used only to check whether the relay board is reachable.
+/status is used to sync actual device states.
 ```
 
 ---
 
 ## Hardware Used
 
-* ESP32-S3 N16R8
-* INMP441 I2S microphone
-* MAX98357A I2S amplifier
-* 0.96 inch SSD1306 OLED display
-* Onboard RGB LED on ESP32-S3
-* Speaker
-* PC or laptop for running the ZYRA server
-* Separate ESP8266 Smart Extension relay board
+Main ZYRA assistant hardware:
+
+| Component                  | Purpose                                      |
+| -------------------------- | -------------------------------------------- |
+| ESP32-S3 N16R8             | Main ZYRA firmware device                    |
+| INMP441 microphone         | Voice input                                  |
+| MAX98357A I2S amplifier    | Speaker output                               |
+| Passive speaker            | ZYRA voice playback                          |
+| 0.96 inch I2C OLED display | Visual state feedback                        |
+| Onboard RGB LED            | Mode/state feedback                          |
+
+Relay-board hardware is maintained separately in the Smart-Switch-Board repository.
+
+Current controllable devices through the relay board:
+
+| Relay | Device        |
+| ----- | ------------- |
+| 1     | TV            |
+| 2     | Soundbar      |
+| 3     | Subwoofer     |
+| 4     | Rear speakers |
 
 ---
 
@@ -508,10 +572,10 @@ Go to the server folder:
 cd C:\Users\abhia\Documents\ZYRA\zyra-server
 ```
 
-Create a virtual environment:
+Create virtual environment:
 
 ```powershell
-py -3.11 -m venv .venv
+python -m venv .venv
 ```
 
 Activate it:
@@ -543,14 +607,21 @@ python -m pip install -r requirements.txt
 ## Kokoro TTS Setup
 
 Online TTS:
-- Generated live by Kokoro in zyra-server/tts.py.
+
+* Generated live by Kokoro in `zyra-server/tts.py`
+* Uses the `af_heart` voice
+* Runs on CPU so Whisper can continue using CUDA
+* Outputs raw PCM audio streamed back to the ESP32-S3
 
 Offline TTS:
-- Fixed WAV prompts stored in zyra-firmware/spiffs.
-- These files are flashed into the ESP32-S3 storage SPIFFS partition
+
+* Fixed WAV prompts stored in `zyra-firmware/spiffs/`
+* These files are flashed into the ESP32-S3 storage SPIFFS partition
+
 ```text
 zyra-firmware/spiffs/
 ```
+
 They are included in the repository and are flashed automatically with the ESP32 SPIFFS image.
 
 ---
@@ -574,26 +645,41 @@ Example:
 ```env
 PYTHONIOENCODING=utf-8
 
+# Ollama
 OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:3b-instruct-q4_0
 
+# Server
 HOST=0.0.0.0
 PORT=8765
 
+# Whisper
 WHISPER_MODEL=small.en
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE=float16
 
-SMART_HOME_BASE_URLS=http://192.168.29.97
-SMART_HOME_TIMEOUT_SEC=2.0
+# Home Assistant — Mode 1: Online HA Mode
+HOME_ASSISTANT_URL=http://192.168.XXX.XXX:8123
+HOME_ASSISTANT_TOKEN=paste_your_long_lived_access_token_here
+HOME_ASSISTANT_TIMEOUT_SEC=5.0
+
+# Existing Home Assistant MQTT switch entity IDs
+HA_ENTITY_TV=switch.your_tv_entity
+HA_ENTITY_SOUNDBAR=switch.your_soundbar_entity
+HA_ENTITY_SUBWOOFER=switch.your_subwoofer_entity
+HA_ENTITY_REAR=switch.your_rear_speakers_entity
+
+# ESP8266 relay-board Home IP fallback — Mode 2: Online Relay Mode
+RELAY_HOME_BASE_URLS=http://192.168.XXX.XXX
+RELAY_HTTP_TIMEOUT_SEC=2.5
 ```
 
-Use the IP address of your Smart Extension relay board for `SMART_HOME_BASE_URLS`.
+Use the IP address of your Smart Extension relay board for `RELAY_HOME_BASE_URLS`.
 
 Multiple relay-board URLs can be given as a comma-separated list:
 
 ```env
-SMART_HOME_BASE_URLS=http://192.168.29.97,http://192.168.31.156
+RELAY_HOME_BASE_URLS=http://192.168.29.97,http://192.168.31.156
 ```
 
 Do not commit `.env`.
@@ -621,17 +707,28 @@ Expected output:
 ```text
 Whisper ready
 LLM loaded into GPU
-TTS engine ready
+Kokoro TTS ready
 Memory engine ready
+Smart-home engine ready
 All engines ready
 Uvicorn running on http://0.0.0.0:8765
 ```
 
-Health check:
+Fast server health check:
 
 ```text
 http://localhost:8765/health
 ```
+
+This endpoint should return quickly and must not depend on Home Assistant or the ESP8266 relay board.
+
+Smart-home backend health/debug endpoint:
+
+```text
+http://localhost:8765/smart-home/health
+```
+
+This endpoint may report Home Assistant or relay availability and is intended for debugging.
 
 ---
 
@@ -651,6 +748,26 @@ Expected:
 ✓ Kokoro TTS working
 ✓ Memory working
 ✓✓✓ All components working
+```
+
+Test the smart-home backend selection:
+
+```powershell
+python test_home_assistant.py
+```
+
+Expected when Home Assistant is available:
+
+```text
+preferred_mode: online_intelligent_ha
+active_backend: home_assistant
+```
+
+Expected when Home Assistant is unavailable but the relay board is reachable:
+
+```text
+preferred_mode: online_intelligent_relay
+active_backend: relay_home
 ```
 
 Test the WebSocket pipeline:
@@ -687,7 +804,7 @@ Create this private file:
 zyra-firmware/main/zyra_config.h
 ```
 
-Add your Wi-Fi, server, and offline relay details:
+Add your Wi-Fi, server, and relay details:
 
 ```c
 #pragma once
@@ -699,7 +816,7 @@ Add your Wi-Fi, server, and offline relay details:
 #define SERVER_IP      "YOUR_LAPTOP_IPV4"
 #define SERVER_PORT    8765
 
-// ── Offline relay fallback ───────────────────────
+// ── Relay fallback ───────────────────────────────
 // ESP8266 smart extension direct AP.
 #define RELAY_AP_SSID      "ESP-REMOTE-DIRECT"
 #define RELAY_AP_PASSWORD  "12345678"
@@ -821,7 +938,7 @@ Connected to ZYRA server
 ZYRA online
 ```
 
-Expected wakeword flow:
+Expected online wakeword flow:
 
 ```text
 Wakeword detected
@@ -831,14 +948,40 @@ Playing response
 Returning to idle
 ```
 
-Expected offline fallback output when the server is unavailable:
+Expected Online HA Mode behavior:
+
+```text
+ESP32-S3 connected to ZYRA server
+ZYRA server uses Home Assistant backend
+Home Assistant controls MQTT relay switches
+```
+
+Expected Online Relay Mode behavior when Home Assistant is unavailable:
+
+```text
+ESP32-S3 connected to ZYRA server
+ZYRA server detects Home Assistant unavailable
+ZYRA server uses ESP8266 relay home IP fallback
+```
+
+Expected serverless relay fallback output when the server is unavailable:
 
 ```text
 Server connection failed
-Entering offline relay mode
+Entering serverless mode
+Smart-home control ready
 Offline speech ready
 Offline voice recognizer started
-Offline relay status synced
+Relay status synced
+```
+
+Expected restore output when the server returns:
+
+```text
+Checking if ZYRA server is back
+Connected to ZYRA server
+Server restored
+Switching back to online mode
 ```
 
 ---
@@ -904,7 +1047,7 @@ zyra-firmware/sdkconfig
 zyra-firmware/spiffs/
 ```
 
-Only commit `zyra-firmware/spiffs/` when it contains required source WAV prompts for offline mode. Do not commit generated `.bin`, `.elf`, `.map`, or build output files.
+Only commit `zyra-firmware/spiffs/` when it contains required source WAV prompts for offline/serverless mode. Do not commit generated `.bin`, `.elf`, `.map`, or build output files.
 
 The Smart Extension relay-board firmware should be committed in its own separate repository.
 
@@ -954,74 +1097,75 @@ Check:
 * `SERVER_IP` is the laptop IPv4 address
 * Firewall allows port `8765`
 * WebSocket path is `/zyra`
+* `http://SERVER_IP:8765/health` returns quickly with HTTP 200
 
 ### Smart-home command is understood but device does not respond
 
 Check:
 
-* Smart Extension relay board is powered
-* Relay board and ZYRA server are on the same network
-* `SMART_HOME_BASE_URLS` points to the relay board IP
-* Relay board HTTP endpoints are working
-* Browser can open the relay board status page
-* `/status` returns four comma-separated values
+* Home Assistant is running if using Online HA Mode
+* Home Assistant long-lived access token is valid
+* `.env` has correct `HA_ENTITY_TV`, `HA_ENTITY_SOUNDBAR`, `HA_ENTITY_SUBWOOFER`, and `HA_ENTITY_REAR`
+* Home Assistant MQTT switches are controlling the ESP8266 relay board correctly
+* If Home Assistant is unavailable, the ESP8266 relay board home IP is reachable
+* `RELAY_HOME_BASE_URLS` points to the relay board IP
+* Browser can open `http://RELAY_IP/ping`
+* Browser can open `http://RELAY_IP/status`
 
 ### Offline relay mode is not working
 
 Check:
 
-* ESP8266 relay board direct AP is enabled
-* `RELAY_AP_SSID` matches the ESP8266 AP name
-* `RELAY_AP_PASSWORD` is correct
-* `RELAY_HOME_BASE_URL` and `RELAY_AP_BASE_URL` are correct
-* ESP8266 direct AP IP is reachable
-* `/status` works at the relay base URL
-* Router/client isolation is not involved when using normal LAN mode
+* `RELAY_HOME_BASE_URL` in `zyra_config.h` includes `http://`
+* ESP8266 relay board is powered
+* ESP8266 relay board is connected to home Wi-Fi
+* ESP32-S3 and ESP8266 are on the same network
+* `/ping` returns `pong`
+* `/status` returns four comma-separated values
+* `smart_home_control.c` is included in the firmware build
+* `main.c` includes `smart_home_control.h`
 
 ### Offline voice command is not working
 
 Check:
 
 * ESP-SR MultiNet English model is enabled
-* `offline_voice.c` is included in the firmware build
-* Microphone input level is high enough
-* Command phrases are registered in serial monitor
-* Probability threshold is not too strict
-* Offline relay mode is active
+* Model partition is flashed
+* Serial monitor shows offline voice command registration
+* Wakeword is detected before the offline command
+* Speak one of the supported fixed offline command phrases
+* Offline voice is expected to handle only limited relay commands
 
 ### Offline speech prompt is not playing
 
 Check:
 
-* `offline_speech.c` is included in the firmware build
-* SPIFFS is mounted successfully
-* Required `.wav` files exist inside `zyra-firmware/spiffs/`
+* `zyra-firmware/spiffs/` contains the WAV files
+* SPIFFS partition is flashed
+* `offline_speech_init()` succeeds
 * WAV files are mono 16-bit PCM
-* SPIFFS image is flashed into the `storage` partition
-* MAX98357 pins match `audio_pipeline.c`
-
+* MAX98357A wiring matches `audio_pipeline.c`
 
 ### Capture buffer allocation failed
 
-Enable PSRAM in ESP-IDF menuconfig.
+Check:
 
-Expected healthy log:
-
-```text
-Free PSRAM before alloc: ...
-Capture buffer allocated successfully
-```
+* ESP32-S3 board has PSRAM
+* PSRAM is enabled in `sdkconfig`
+* Board target is set to `esp32s3`
+* Use `idf.py fullclean` after sdkconfig or partition changes
 
 ### OLED I2C timeout
 
-Check OLED pins in `display.c`:
+Check:
 
-```c
-#define OLED_SDA 15
-#define OLED_SCL 16
-```
-
-If your OLED test sketch uses different pins, update `display.c` to match your real wiring.
+* OLED SDA/SCL pins match `display.c`
+* OLED address is `0x3C`
+* OLED is powered from 3.3V
+* GND is common with ESP32-S3
+* Wires are short and stable
+* Avoid loose breadboard/jumper connections
+* Add external pull-up resistors if the OLED is unstable under full firmware load
 
 ---
 
@@ -1030,34 +1174,42 @@ If your OLED test sketch uses different pins, update `display.c` to match your r
 Completed:
 
 * PC-side AI server
+* Fast server-only `/health` endpoint for firmware liveness checks
+* Separate smart-home backend health/debug endpoint
 * Faster-Whisper STT
 * Ollama LLM
 * LLM warmup for lower first-request delay
-* Kokoro TTS
-* Jarvis-style Kokoro voice configuration
+* Kokoro TTS with `af_heart` voice
 * Memory engine
 * Intent routing
 * Smart-home command understanding
-* Local relay-board command forwarding from the server
+* Home Assistant backend for Online HA Mode
+* ESP8266 relay home-IP fallback backend for Online Relay Mode
+* Server-side backend priority: Home Assistant first, relay fallback second
 * ESP32-S3 Wi-Fi connection
 * ESP32-S3 WebSocket connection
 * Jarvis wakeword support using ESP-SR WakeNet
 * ESP-SR MultiNet offline command recognizer
 * WebSocket disconnect callback support
 * Runtime fallback trigger when server connection is lost
+* Runtime guard to avoid fallback during an active online request
+* Runtime guard to avoid online and serverless voice loops running together
+* Serverless Relay Fallback using firmware-side `smart_home_control`
+* Automatic restore from serverless relay fallback back to online mode
 * I2S mic initialization
 * I2S amplifier initialization
 * PSRAM audio buffer allocation
-* Firmware-side offline relay connectivity
-* Firmware-side offline relay status sync
+* Firmware-side smart-home relay status sync
 * Firmware-side offline speech prompt playback
-* SPIFFS asset support for offline mode
-* OLED states for wakeword and offline relay mode
+* SPIFFS asset support for offline/serverless mode
+* OLED states for wakeword, online, serverless relay, speaking, success, and error states
 * RGB status LED feedback for online, serverless, offline, speaking, success, error, and connection failure states
 
 Not included yet:
 
 * Full offline AI conversation without the ZYRA server
 * Full natural conversation directly on the ESP32-S3
+* Firmware-side Serverless HA Mode using ESP32-S3 → Home Assistant REST without the ZYRA server
+* Fully finalized standalone `runtime_mode.c` state-machine module
 * Final UI appearance upgrade
 * Smart Extension relay-board firmware inside this repository
