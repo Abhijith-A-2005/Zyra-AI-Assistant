@@ -320,7 +320,7 @@ esp_err_t audio_play_response(const uint8_t* data,
         offset += written;
     }
 
-    ESP_LOGI(TAG, "Played %zu bytes at %dHz", len, sample_rate);
+    ESP_LOGD(TAG, "Played %zu bytes at %dHz", len, sample_rate);
     return ESP_OK;
 }
 

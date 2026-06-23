@@ -19,3 +19,7 @@ void ws_client_stop(void);
 void ws_set_disconnect_callback(ws_disconnect_callback_t callback);
 esp_err_t ws_send_status(const char* status);
 bool ws_response_final(void);
+bool ws_last_response_failed(void);
+void ws_clear_response_result(void);
+bool ws_audio_stream_active(void);
+void ws_clear_audio_stream_active(void);

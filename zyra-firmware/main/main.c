@@ -24,6 +24,7 @@
 
 // Our modules
 #include "audio_pipeline.h"
+#include "audio_streamer.h"
 #include "websocket_client.h"
 #include "display.h"
 #include "smart_home_control.h"
@@ -59,6 +60,10 @@ static volatile bool s_offline_mode = false;
 // This means: relay control is happening through home Wi-Fi.
 static volatile bool s_home_relay_mode = false;
 
+// This means: server is unavailable, but firmware is controlling devices
+// through Home Assistant REST API on home Wi-Fi.
+static volatile bool s_serverless_ha_mode = false;
+
 // This means: emergency relay control is happening through ESP-REMOTE-DIRECT.
 static volatile bool s_relay_ap_mode = false;
 
@@ -67,8 +72,10 @@ static volatile bool s_force_direct_ap_fallback = false;
 static volatile bool s_relay_error_active = false;
 static volatile bool s_online_voice_paused = false;
 static volatile bool s_home_relay_starting = false;
+static volatile bool s_runtime_mode_switching = false;
 // True while an online wake/capture/send/response cycle is active.
 static volatile bool s_online_interaction_active = false;
+static volatile bool s_offline_command_active = false;
 static int s_relay_fail_count = 0;
 static int s_relay_ok_count = 0;
 
@@ -80,7 +87,11 @@ static TaskHandle_t s_zyra_task_handle = NULL;
 static void smart_home_control_task(void* arg);
 static void zyra_task(void* param);
 static bool start_offline_mode(const char* reason);
+static bool start_serverless_ha_mode(const char* reason);
 static bool start_home_relay_mode(const char* reason);
+static bool start_best_serverless_mode(const char* reason);
+static bool switch_home_relay_to_serverless_ha(const char* reason);
+static void home_assistant_restore_task(void* arg);
 static void request_direct_ap_fallback(const char* reason);
 static void handle_offline_voice_ui(OfflineVoiceUiEvent event);
 static void handle_offline_voice_command(
@@ -210,26 +221,43 @@ static const char* offline_status_prompt_filename(void) {
 }
 
 static void play_offline_response(OfflineVoiceCommand command, bool ok) {
-
-    status_led_set_state(STATUS_LED_SPEAKING);
-
     if (!ok) {
+        // Command failed = solid red.
+        status_led_set_state(STATUS_LED_COMMAND_FAILED);
+
         if (offline_speech_play("failed.wav") != ESP_OK) {
             ESP_LOGW(TAG, "Failed prompt missing");
         }
+
+        // Force red again after audio playback.
+        status_led_set_state(STATUS_LED_COMMAND_FAILED);
+
     } else if (command == OFFLINE_VOICE_CMD_STATUS) {
+        // Status response is successful speech.
+        status_led_set_state(STATUS_LED_SPEAKING);
+
         const char* status_prompt = offline_status_prompt_filename();
 
         if (offline_speech_play(status_prompt) != ESP_OK) {
             ESP_LOGW(TAG, "Specific status prompt missing: %s", status_prompt);
             offline_speech_play("status.wav");
         }
+
+        // Successful command/status result = green.
+        status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
+
     } else {
+        // Normal successful command response = green/speaking.
+        status_led_set_state(STATUS_LED_SPEAKING);
+
         const char* prompt = offline_command_prompt(command);
 
         if (offline_speech_play(prompt) != ESP_OK) {
             offline_speech_play("done.wav");
         }
+
+        // Successful command result = green.
+        status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
     }
 
     drain_mic_frames(35);
@@ -768,15 +796,32 @@ static void websocket_lost_callback(void) {
     request_runtime_offline_fallback(false);
 }
 
+static bool serverless_ha_hub_is_alive(void) {
+    if (!s_serverless_ha_mode) {
+        return false;
+    }
+
+    SmartHomeBackend old_backend = smart_home_control_get_backend();
+
+    smart_home_control_set_backend(SMART_HOME_BACKEND_HOME_ASSISTANT);
+
+    bool alive = smart_home_control_is_available();
+
+    smart_home_control_set_backend(old_backend);
+
+    return alive;
+}
 
 static void handle_offline_voice_command(
     OfflineVoiceCommand command,
     const char* phrase,
     float probability
 ) { 
-    
+    s_offline_command_active = true;
+
     if (!s_offline_mode || s_switching_wifi) {
         ESP_LOGW(TAG, "Ignoring offline voice command outside offline mode");
+        s_offline_command_active = false;
         return;
     }
 
@@ -920,11 +965,49 @@ static void handle_offline_voice_command(
     } else {
         ESP_LOGE(TAG, "Offline voice command failed");
 
-        display_show_message(
-            "COMMAND FAILED",
-            offline_command_label(command),
-            "CHECK RELAY"
-        );
+        // Command failed = solid red in every mode.
+        status_led_set_state(STATUS_LED_COMMAND_FAILED);
+
+        if (s_serverless_ha_mode) {
+            if (serverless_ha_hub_is_alive()) {
+                ESP_LOGW(
+                    TAG,
+                    "HA hub is alive. Staying in Serverless HA mode. Target HA entity may be unavailable."
+                );
+
+                display_show_message(
+                    "COMMAND UNDERSTOOD",
+                    "HA DEVICE",
+                    "UNAVAILABLE"
+                );
+            } else {
+                ESP_LOGW(
+                    TAG,
+                    "HA hub is unavailable. Leaving Serverless HA mode."
+                );
+
+                // HA hub itself is dead, so firmware should fall back to direct relay.
+                if (start_home_relay_mode("Home Assistant hub unavailable")) {
+                    display_show_message(
+                        "SERVERLESS",
+                        "RELAY MODE",
+                        "ACTIVE"
+                    );
+                } else {
+                    display_show_message(
+                        "COMMAND FAILED",
+                        "HA + RELAY",
+                        "UNAVAILABLE"
+                    );
+                }
+            }
+        } else {
+            display_show_message(
+                "COMMAND FAILED",
+                offline_command_label(command),
+                "CHECK CONNECTION"
+            );
+        }
     }
 
     play_offline_response(command, ok);
@@ -932,12 +1015,17 @@ static void handle_offline_voice_command(
     if (s_offline_mode) {
         if (command == OFFLINE_VOICE_CMD_STATUS && ok) {
             vTaskDelay(pdMS_TO_TICKS(2500));
+        } else if (!ok) {
+            // Keep solid red visible a bit longer for failed commands.
+            vTaskDelay(pdMS_TO_TICKS(1800));
         } else {
             vTaskDelay(pdMS_TO_TICKS(800));
         }
 
         set_state(DISP_IDLE);
     }
+
+    s_offline_command_active = false;
 
 }
 
@@ -952,12 +1040,13 @@ static bool start_offline_mode(const char* reason) {
     // Direct offline AP mode owns the mic.
     s_offline_mode = true;
     s_home_relay_mode = false;
+    s_serverless_ha_mode = false;
     s_relay_ap_mode = true;
     s_online_voice_paused = true;
 
     ws_client_stop();
 
-    smart_home_control_set_base_url(RELAY_AP_BASE_URL);
+    smart_home_control_set_backend(SMART_HOME_BACKEND_RELAY_AP);
 
     // First connect to ESP8266 direct AP.
     // Do not start offline voice while Wi-Fi is switching.
@@ -986,7 +1075,7 @@ static bool start_offline_mode(const char* reason) {
         xTaskCreatePinnedToCore(
             smart_home_control_task,
             "SmartHome",
-            4096,
+            8192,
             NULL,
             4,
             &s_smart_home_control_task_handle,
@@ -1002,40 +1091,143 @@ static bool start_offline_mode(const char* reason) {
     return true;
 }
 
-static bool start_home_relay_mode(const char* reason) {
-    if (s_offline_mode && s_home_relay_mode && !s_switching_wifi) {
-        ESP_LOGW(TAG, "Home relay offline mode already active");
-        return true;
-    }
+static bool switch_serverless_ha_to_home_relay(const char* reason) {
+    ESP_LOGW(TAG, "Switching Serverless HA -> Serverless Relay: %s", reason);
 
-    ESP_LOGW(TAG, "Entering serverless mode: %s", reason);
-    s_home_relay_starting = true;   
+    s_runtime_mode_switching = true;
+
+    smart_home_control_set_backend(SMART_HOME_BACKEND_RELAY_HOME);
+
+    if (!smart_home_control_fetch_status()) {
+        ESP_LOGE(TAG, "Home relay unavailable after HA failure");
+
+        s_runtime_mode_switching = false;
+        smart_home_control_set_backend(SMART_HOME_BACKEND_HOME_ASSISTANT);
+
+        display_show_message(
+            "HA FAILED",
+            "RELAY ALSO",
+            "UNAVAILABLE"
+        );
+
+        vTaskDelay(pdMS_TO_TICKS(1800));
+        set_state(DISP_IDLE);
+
+        return false;
+    }
 
     s_offline_mode = true;
     s_home_relay_mode = true;
+    s_serverless_ha_mode = false;
     s_relay_ap_mode = false;
     s_online_voice_paused = true;
 
-    // Stop WebSocket only. Do NOT disconnect home Wi-Fi.
-    ws_client_stop();
+    status_led_set_mode(STATUS_LED_MODE_SERVERLESS);
+    status_led_set_state(STATUS_LED_MODE_SOLID);
 
-    smart_home_control_set_base_url(RELAY_HOME_BASE_URL);
-    smart_home_control_init();
+
+    display_show_message(
+        "SERVERLESS",
+        "RELAY MODE",
+        "ACTIVE"
+    );
+
+    vTaskDelay(pdMS_TO_TICKS(1800));
+
+    // Return display to idle
+    set_state(DISP_IDLE);
+
+    ESP_LOGW(TAG, "Serverless Relay mode active after HA failure");
+
+    s_runtime_mode_switching = false;
+    return true;
+}
+
+static bool start_serverless_ha_mode(const char* reason) {
+    ESP_LOGW(TAG, "Entering serverless HA mode: %s", reason);
+
+    s_offline_mode = true;
+    s_serverless_ha_mode = true;
+    s_home_relay_mode = false;
+    s_relay_ap_mode = false;
+    s_online_voice_paused = true;
+
+    smart_home_control_set_backend(SMART_HOME_BACKEND_HOME_ASSISTANT);
+
+    // First check HA hub.
+    // If HA is OFF, do not check /api/states for every entity.
+    if (!smart_home_control_is_available()) {
+        ESP_LOGW(TAG, "Home Assistant hub is not reachable");
+
+        s_serverless_ha_mode = false;
+        s_offline_mode = false;
+
+        smart_home_control_set_backend(SMART_HOME_BACKEND_RELAY_HOME);
+        return false;
+    }
+
+    // HA hub is alive. Entity status may still be unavailable.
+    // That should NOT make us leave HA mode.
+    if (!smart_home_control_fetch_status()) {
+        ESP_LOGW(
+            TAG,
+            "HA hub is alive, but configured HA entities may be unavailable. Staying in Serverless HA mode."
+        );
+    }
+
+    status_led_set_mode(STATUS_LED_MODE_SERVERLESS);
+    status_led_set_state(STATUS_LED_MODE_SOLID);
+
+    display_show_message(
+        "SERVERLESS",
+        "HOME ASSISTANT",
+        "MODE"
+    );
+
+    vTaskDelay(pdMS_TO_TICKS(1800));
+
+    set_state(DISP_IDLE);
+
+    offline_voice_set_ui_callback(handle_offline_voice_ui);
+    offline_voice_start(handle_offline_voice_command);
+
+    ESP_LOGI(TAG, "ZYRA switched to serverless HA mode");
+    return true;
+}
+
+static bool start_home_relay_mode(const char* reason) {
+    if (s_offline_mode && s_home_relay_mode && !s_switching_wifi) {
+        ESP_LOGW(TAG, "Serverless relay mode already active");
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Entering serverless relay mode: %s", reason);
+    s_home_relay_starting = true;
+
+    s_offline_mode = true;
+    s_home_relay_mode = true;
+    s_serverless_ha_mode = false;
+    s_relay_ap_mode = false;
+    s_online_voice_paused = true;
+
+    
+    // If HA mode failed before this, backend may still be HOME_ASSISTANT.
+    // So force it back to RELAY_HOME.
+    smart_home_control_set_backend(SMART_HOME_BACKEND_RELAY_HOME);
 
     // Confirm ESP8266 is reachable on home Wi-Fi.
     if (!smart_home_control_fetch_status()) {
-        ESP_LOGW(TAG, "Home relay IP not reachable. Falling back to offline mode.");
+        ESP_LOGW(TAG, "Home relay IP not reachable");
 
         s_home_relay_mode = false;
         s_offline_mode = false;
         s_home_relay_starting = false;
 
-        return start_offline_mode("home relay unavailable");
+        return false;
     }
 
-    // Current mode colour = purple.
     status_led_set_mode(STATUS_LED_MODE_SERVERLESS);
-    // Show SERVERLESS / LOCAL MODE before starting offline voice then idle.
+
     show_transition_state(DISP_SERVERLESS, 2200);
 
     if (!s_offline_mode ||
@@ -1045,9 +1237,10 @@ static bool start_home_relay_mode(const char* reason) {
 
         ESP_LOGW(
             TAG,
-            "Serverless startup cancelled because online mode is active again"
+            "Serverless relay startup cancelled because online mode is active again"
         );
 
+        s_home_relay_mode = false;
         s_home_relay_starting = false;
         return true;
     }
@@ -1056,9 +1249,9 @@ static bool start_home_relay_mode(const char* reason) {
         xTaskCreatePinnedToCore(
             smart_home_control_task,
             "SmartHome",
-            4096,
+            8192,
             NULL,
-            4,
+            4, 
             &s_smart_home_control_task_handle,
             0
         );
@@ -1069,8 +1262,41 @@ static bool start_home_relay_mode(const char* reason) {
 
     s_home_relay_starting = false;
 
-    ESP_LOGI(TAG, "ZYRA switched to serverless mode");
+    ESP_LOGI(TAG, "ZYRA switched to serverless relay mode");
     return true;
+}
+
+static bool start_best_serverless_mode(const char* reason) {
+    if (s_runtime_mode_switching) {
+        ESP_LOGW(TAG, "Runtime mode switch already running");
+        return true;
+    }
+
+    s_runtime_mode_switching = true;
+
+    ESP_LOGW(TAG, "Choosing best serverless mode: %s", reason);
+
+    bool ok = false;
+
+    if (start_serverless_ha_mode(reason)) {
+        ok = true;
+        goto done;
+    }
+
+    ESP_LOGW(TAG, "Serverless HA unavailable. Trying home relay mode.");
+
+    if (start_home_relay_mode(reason)) {
+        ok = true;
+        goto done;
+    }
+
+    ESP_LOGW(TAG, "Home relay unavailable. Trying emergency AP mode.");
+
+    ok = start_offline_mode(reason);
+
+done:
+    s_runtime_mode_switching = false;
+    return ok;
 }
 
 static void runtime_fallback_task(void* arg) {
@@ -1133,9 +1359,7 @@ static void runtime_fallback_task(void* arg) {
 
         ESP_LOGE(TAG, "%s", log_reason);
 
-        if (!start_home_relay_mode(offline_reason)) {
-            start_offline_mode(offline_reason);
-        }
+        start_best_serverless_mode(offline_reason);
     }
 }
 
@@ -1145,11 +1369,13 @@ static void server_reconnect_task(void* arg) {
 
         // Only try reconnecting when we are in home relay fallback.
         // In direct AP mode, Zyra is no longer on home Wi-Fi.
-        if (!s_offline_mode || !s_home_relay_mode || s_relay_ap_mode) {
+        if (!s_offline_mode || (!s_home_relay_mode && !s_serverless_ha_mode) ||
+            s_relay_ap_mode) {
             continue;
         }
 
-        if (s_switching_wifi || s_home_relay_starting || s_online_interaction_active) {
+        if (s_switching_wifi || s_home_relay_starting || s_online_interaction_active
+         || s_runtime_mode_switching) {
             continue;
         }
 
@@ -1184,10 +1410,13 @@ static void server_reconnect_task(void* arg) {
         // Now release online mode after the user has seen the notification.
         s_offline_mode = false;
         s_home_relay_mode = false;
+        s_serverless_ha_mode = false;
         s_relay_ap_mode = false;
         s_force_runtime_fallback = false;
         s_force_direct_ap_fallback = false;
         s_online_voice_paused = false;
+
+        smart_home_control_set_backend(SMART_HOME_BACKEND_RELAY_HOME);
 
         set_state(DISP_IDLE);
 
@@ -1440,6 +1669,7 @@ static void zyra_task(void* param) {
         // ── PHASE 3: Send to server ────────────────
         set_state(DISP_PROCESSING);
         s_online_interaction_active = true;
+        ws_clear_response_result();
         ESP_LOGI(TAG, "Sending %zu bytes (%dms of audio) to server",
                  captured,
                  (int)((captured / 2) * 1000 / CAPTURE_SAMPLE_RATE));
@@ -1456,92 +1686,122 @@ static void zyra_task(void* param) {
         }
 
         // ── PHASE 4 + 5: Streamed response playback ───────
-        // Server may send one audio chunk or many chunks.
-        // Each chunk is played, then ESP32 sends an ACK so the
-        // server can safely send the next chunk.
+        // New streaming design:
+        // websocket_client.c receives audio frames and pushes them directly
+        // to audio_streamer. main.c only controls UI and waits for final completion.
 
-        bool response_stream_done = false;
+        int timeout = 0;
+        bool speaking_ui_started = false;
 
-        while (!response_stream_done) {
-            int timeout = 0;
-
-            while (!ws_response_ready() && timeout < 1200) {
-                if (!ws_is_connected()) {
-                    ESP_LOGE(TAG, "Server disconnected while waiting for response");
-                    s_online_interaction_active = false;
-                    request_runtime_offline_fallback(true);
-                    break;
-                }
-
-                vTaskDelay(pdMS_TO_TICKS(100));
-                timeout++;
-            }
-
-            if (!ws_response_ready()) {
-                ESP_LOGW(TAG, "Response chunk timeout");
+        while (!ws_response_ready() && timeout < 12000) {
+            if (!ws_is_connected()) {
+                ESP_LOGE(TAG, "Server disconnected while waiting for streamed response");
 
                 s_online_interaction_active = false;
-
-                if (!ws_is_connected()) {
-                    set_state(DISP_OFFLINE);
-                } else {
-                    set_state(DISP_IDLE);
-                }
-
+                request_runtime_offline_fallback(true);
                 break;
             }
 
-            set_state(DISP_SPEAKING);
+            // Audio can start before ws_response_ready() becomes true.
+            if (!speaking_ui_started && ws_audio_stream_active()) {
+                bool online_response_failed = ws_last_response_failed();
 
-            uint8_t* audio_data = NULL;
-            int      sr         = 22050;
-            size_t   audio_len  = ws_get_response(&audio_data, &sr);
-            bool     final_part = ws_response_final();
+                if (online_response_failed) {
+                    status_led_set_state(STATUS_LED_COMMAND_FAILED);
 
-            uint8_t* play_copy = NULL;
-            size_t   play_len  = 0;
-            int      play_sr   = sr;
-
-            if (audio_data && audio_len > 0) {
-                play_copy = malloc(audio_len);
-
-                if (play_copy) {
-                    memcpy(play_copy, audio_data, audio_len);
-                    play_len = audio_len;
+                    display_show_message(
+                        "COMMAND FAILED",
+                        "SMART HOME",
+                        "UNAVAILABLE"
+                    );
                 } else {
-                    ESP_LOGE(TAG, "Failed to allocate playback copy");
+                    set_state(DISP_SPEAKING);
+                    status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
                 }
+
+                ws_clear_audio_stream_active();
+                speaking_ui_started = true;
             }
 
-            // Free websocket response buffer BEFORE playback.
-            // This allows the websocket client to receive the next chunk
-            // while the current chunk is still playing.
-            ws_free_response();
+            vTaskDelay(pdMS_TO_TICKS(10));
+            timeout++;
+        }
 
-            // Tell server this chunk is safely copied.
-            // Server can now send the next chunk while we play this one.
-            ws_send_status("audio_chunk_buffered");
+        if (!ws_response_ready()) {
+            ESP_LOGW(TAG, "Streamed response timeout");
 
-            if (play_copy && play_len > 0) {
-                ESP_LOGI(
-                    TAG,
-                    "Playing buffered response chunk: %zu bytes at %dHz final=%d",
-                    play_len,
-                    play_sr,
-                    final_part ? 1 : 0
+            s_online_interaction_active = false;
+
+            if (!ws_is_connected()) {
+                set_state(DISP_OFFLINE);
+            } else {
+                set_state(DISP_IDLE);
+            }
+
+            break;
+        }
+
+        bool online_response_failed = ws_last_response_failed();
+        bool final_part = ws_response_final();
+
+        ESP_LOGI(
+            TAG,
+            "Final streamed response ready failed=%d final=%d",
+            online_response_failed ? 1 : 0,
+            final_part ? 1 : 0
+        );
+
+        // Fallback UI update.
+        if (!speaking_ui_started) {
+            if (online_response_failed) {
+                status_led_set_state(STATUS_LED_COMMAND_FAILED);
+
+                display_show_message(
+                    "COMMAND FAILED",
+                    "SMART HOME",
+                    "UNAVAILABLE"
                 );
-
-                audio_play_response(play_copy, play_len, play_sr);
-                free(play_copy);
             } else {
-                ESP_LOGI(TAG, "Empty response chunk");
+                set_state(DISP_SPEAKING);
+                status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
             }
 
-            if (final_part) {
-                response_stream_done = true;
-            } else {
-                set_state(DISP_PROCESSING);
-            }
+            speaking_ui_started = true;
+        }
+
+        // Legacy fallback check.
+        // Normally streamed audio has already been played by audio_streamer.
+        // But if some old non-streamed path returns a full buffer, play it here.
+        uint8_t* audio_data = NULL;
+        int sr = 22050;
+        size_t audio_len = ws_get_response(&audio_data, &sr);
+
+        if (audio_data && audio_len > 0) {
+            ESP_LOGW(
+                TAG,
+                "Legacy buffered playback path used: %zu bytes at %dHz",
+                audio_len,
+                sr
+            );
+
+            audio_play_response(audio_data, audio_len, sr);
+        } else {
+            // Normal streaming path.
+            // Wait until audio_streamer has consumed all queued PCM blocks.
+            ESP_LOGI(TAG, "Waiting for streamed audio playback to finish");
+            audio_streamer_wait_idle(45000);
+        }
+
+        // Clean final response state only after playback has finished.
+        ws_free_response();
+        ws_clear_response_result();
+
+        if (online_response_failed) {
+            // Keep red visible briefly after failed speech finishes.
+            status_led_set_state(STATUS_LED_COMMAND_FAILED);
+            vTaskDelay(pdMS_TO_TICKS(900));
+        } else {
+            status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
         }
 
         s_online_interaction_active = false; 
@@ -1598,7 +1858,15 @@ static void handle_offline_voice_ui(
 static void smart_home_control_task(void* param) {
     ESP_LOGI(TAG, "Offline relay task started");
 
-    smart_home_control_init();
+    // Do NOT call smart_home_control_init() here.
+    // Why:
+    // smart_home_control_init() should run once during boot.
+    // This task should only monitor the currently selected backend.
+
+    if (s_runtime_mode_switching) {
+        ESP_LOGW(TAG, "Offline relay task waiting because runtime mode is switching");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     if (smart_home_control_fetch_status()) {
         ESP_LOGI(TAG, "Offline relay status synced");
@@ -1620,7 +1888,7 @@ static void smart_home_control_task(void* param) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(10000));
 
-        if (s_switching_wifi) {
+        if (s_switching_wifi || s_runtime_mode_switching) {
             continue;
         }
 
@@ -1629,6 +1897,10 @@ static void smart_home_control_task(void* param) {
             s_smart_home_control_task_handle = NULL;
             vTaskDelete(NULL);
             return;
+        }
+
+        if (s_serverless_ha_mode) {
+            continue;
         }
 
         bool relay_ok = smart_home_control_fetch_status();
@@ -1661,11 +1933,126 @@ static void smart_home_control_task(void* param) {
                 s_relay_error_active = false;
                 s_relay_ok_count = 0;
 
-                // E change: temporary relay restored notification
+                // Temporary relay restored notification
                 show_transition_state(DISP_RELAY_RESTORED, 1000);
             }
         } else {
             ESP_LOGI(TAG, "Offline relay live");
+        }
+    }
+}
+
+
+static void boot_serverless_fallback_task(void* arg) {
+    const char* reason = (const char*)arg;
+
+    ESP_LOGW(TAG, "Boot fallback task started: %s", reason);
+
+    start_best_serverless_mode(reason);
+
+    ESP_LOGW(TAG, "Boot fallback task finished");
+
+    vTaskDelete(NULL);
+}
+
+static bool switch_home_relay_to_serverless_ha(const char* reason) {
+    ESP_LOGI(TAG, "HA restore probe: %s", reason);
+
+    // First check HA without changing current relay backend.
+    if (!smart_home_control_home_assistant_available()) {
+        ESP_LOGW(TAG, "HA restore check failed; staying in relay mode");
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Home Assistant restored. Switching Serverless Relay -> Serverless HA");
+
+    s_runtime_mode_switching = true;
+
+    // Now it is safe to actually switch mode/backend.
+    smart_home_control_set_backend(SMART_HOME_BACKEND_HOME_ASSISTANT);
+
+    if (!smart_home_control_fetch_status()) {
+        ESP_LOGW(
+            TAG,
+            "HA restored, but configured target HA entities may be unavailable"
+        );
+    }
+
+    s_offline_mode = true;
+    s_home_relay_mode = false;
+    s_serverless_ha_mode = true;
+    s_relay_ap_mode = false;
+    s_online_voice_paused = true;
+
+    status_led_set_mode(STATUS_LED_MODE_SERVERLESS);
+
+    display_show_message(
+        "SERVERLESS",
+        "HOME ASSISTANT",
+        "RESTORED"
+    );
+
+    status_led_set_state(STATUS_LED_COMMAND_SUCCESS);
+
+    vTaskDelay(pdMS_TO_TICKS(1800));
+    set_state(DISP_IDLE);
+
+    ESP_LOGW(TAG, "Serverless HA mode restored from relay mode");
+
+    s_runtime_mode_switching = false;
+    return true;
+}
+
+static void home_assistant_restore_task(void* arg) {
+    ESP_LOGW(TAG, "HA monitor task started");
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        ESP_LOGI(
+            TAG,
+            "HA monitor tick: offline=%d relay=%d ha=%d ap=%d switching=%d cmd=%d",
+            s_offline_mode,
+            s_home_relay_mode,
+            s_serverless_ha_mode,
+            s_relay_ap_mode,
+            s_runtime_mode_switching,
+            s_offline_command_active
+        );
+
+        if (!s_offline_mode ||
+            s_relay_ap_mode ||
+            s_runtime_mode_switching ||
+            s_switching_wifi ||
+            s_online_interaction_active ||
+            s_offline_command_active) {
+            continue;
+        }
+
+        // Case 1: We are in Serverless HA mode.
+        // Check whether HA hub died.
+        if (s_serverless_ha_mode && !s_home_relay_mode) {
+            ESP_LOGW(TAG, "HA monitor: checking active Home Assistant hub");
+
+            if (!smart_home_control_home_assistant_available()) {
+                ESP_LOGW(TAG, "HA monitor: Home Assistant hub is unavailable");
+
+                switch_serverless_ha_to_home_relay("Home Assistant hub unavailable");
+            }
+
+            continue;
+        }
+
+        // Case 2: We are in Serverless Relay mode.
+        // Check whether HA hub came back.
+        if (s_home_relay_mode && !s_serverless_ha_mode) {
+            ESP_LOGW(TAG, "HA monitor: checking Home Assistant restore");
+
+            if (switch_home_relay_to_serverless_ha("Home Assistant restored")) {
+                ESP_LOGW(TAG, "HA monitor: switched back to Serverless HA mode");
+            }
+
+            continue;
         }
     }
 }
@@ -1696,12 +2083,16 @@ void app_main(void) {
         ESP_LOGE(TAG, "Home WiFi failed");
 
         audio_pipeline_init();
+        // Initialize streaming playback queue.
+        // Online audio should start playing while WebSocket bytes are still arriving.
+        audio_streamer_init();
 
         if (wakeword_engine_init() != ESP_OK) {
             ESP_LOGE(TAG, "Wakeword engine failed");
             set_state(DISP_ERROR);
             return;
         }
+
 
         offline_speech_init();
 
@@ -1717,6 +2108,9 @@ void app_main(void) {
     set_state(DISP_PROCESSING);
 
     audio_pipeline_init();
+    // Initialize streaming playback queue.
+    // Online audio should start playing while WebSocket bytes are still arriving.
+    audio_streamer_init();
 
     if (wakeword_engine_init() != ESP_OK) {
         ESP_LOGE(TAG, "Wakeword engine failed");
@@ -1724,19 +2118,34 @@ void app_main(void) {
         return;
     }
 
+    // Initialize smart-home backend once.
+    smart_home_control_init();
+
     offline_speech_init();
 
+    // Continue normal ZYRA startup.
     ws_set_disconnect_callback(websocket_lost_callback);
 
     xTaskCreatePinnedToCore(
         runtime_fallback_task,
         "RuntimeFallback",
-        4096,
+        16384,
         NULL,
         6,
         &s_runtime_fallback_task_handle,
         0
     );
+
+    // Checks if Home Assistant comes back while Zyra is in Serverless Relay mode.
+    xTaskCreate(
+        home_assistant_restore_task,
+        "HaRestore",
+        8192,
+        NULL,
+        4,
+        NULL
+    );
+
 
     xTaskCreatePinnedToCore(
         server_health_task,
@@ -1765,7 +2174,15 @@ void app_main(void) {
     if (ws_err != ESP_OK) {
         ESP_LOGE(TAG, "Server connection failed");
 
-        start_home_relay_mode("server unavailable during boot");
+        xTaskCreate(
+            boot_serverless_fallback_task,
+            "BootFallback",
+            16384,
+            "server unavailable during boot",
+            5,
+            NULL
+        );
+
         return;
     }
 

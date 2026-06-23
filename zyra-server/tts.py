@@ -1,4 +1,7 @@
 import logging
+import threading
+from collections import OrderedDict
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -10,12 +13,15 @@ KOKORO_VOLUME_GAIN = 1.8
 KOKORO_LIMIT_PEAK = 0.98
 KOKORO_SAMPLE_RATE = 24000
 KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
+KOKORO_CACHE_MAX_ITEMS = 80
+KOKORO_CACHE_MAX_AUDIO_BYTES = 900_000
 
 
 class TTSEngine:
     def __init__(self, name: str = "main", prewarm: bool = True):
         self.name = name
-        self.cache = {}
+        self.cache = OrderedDict()
+        self.cache_lock = threading.Lock()
         
         logger.info(
             f"Loading Kokoro TTS voice on CPU [{self.name}]: {KOKORO_VOICE}"
@@ -53,6 +59,23 @@ class TTSEngine:
                 return b""
 
             text = text.strip()
+
+            cache_key = (
+                text,
+                KOKORO_VOICE,
+                KOKORO_SPEED,
+                KOKORO_VOLUME_GAIN,
+            )
+
+            with self.cache_lock:
+                cached = self.cache.get(cache_key)
+                if cached is not None:
+                    self.cache.move_to_end(cache_key)
+                    logger.info(
+                        f"Kokoro cache hit [{self.name}] {len(cached)} bytes "
+                        f"for: '{text[:60]}'"
+                    )
+                    return cached
 
             generator = self.pipeline(
                 text,
@@ -102,55 +125,17 @@ class TTSEngine:
                 f"for: '{text[:60]}'"
             )
 
+            if len(raw_pcm) <= KOKORO_CACHE_MAX_AUDIO_BYTES:
+                with self.cache_lock:
+                    self.cache[cache_key] = raw_pcm
+                    self.cache.move_to_end(cache_key)
+
+                    while len(self.cache) > KOKORO_CACHE_MAX_ITEMS:
+                        self.cache.popitem(last=False)
+
             return raw_pcm
 
         except Exception as e:
             logger.error(f"Kokoro TTS error: {e}", exc_info=True)
             return b""
     
-# import logging
-# import io
-# import wave
-
-# logger = logging.getLogger(__name__)
-
-# MODEL_PATH = r"C:\Users\abhia\Documents\ZYRA\zyra-server\models\en_US-ljspeech-high.onnx"
-
-
-# class TTSEngine:
-#     def __init__(self):
-#         logger.info("Loading Piper voice model into memory...")
-#         from piper.voice import PiperVoice
-#         self.voice = PiperVoice.load(MODEL_PATH)
-#         self.sample_rate = self.voice.config.sample_rate
-#         logger.info(f"TTS engine ready — sample rate: {self.sample_rate}Hz")
-
-#     def synthesize(self, text: str) -> bytes:
-#         """
-#         Returns raw 16-bit PCM bytes at self.sample_rate Hz, mono.
-#         Uses synthesize_wav() which writes a proper WAV into a BytesIO buffer,
-#         then strips the header so the ESP32 gets raw PCM.
-#         """
-#         try:
-#             buf = io.BytesIO()
-
-#             with wave.open(buf, "wb") as wf:
-#                 wf.setnchannels(1)
-#                 wf.setsampwidth(2)          # 16-bit
-#                 wf.setframerate(self.sample_rate)
-#                 self.voice.synthesize_wav(text, wf)
-
-#             # Strip WAV header — return raw PCM only
-#             buf.seek(0)
-#             with wave.open(buf, "rb") as wf:
-#                 raw_pcm = wf.readframes(wf.getnframes())
-
-#             logger.info(
-#                 f"TTS synthesized {len(raw_pcm)} bytes "
-#                 f"for: '{text[:60]}'"
-#             )
-#             return raw_pcm
-
-#         except Exception as e:
-#             logger.error(f"TTS error: {e}", exc_info=True)
-#             return b""

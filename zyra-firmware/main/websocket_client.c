@@ -1,5 +1,6 @@
 #include "websocket_client.h"
 #include "esp_websocket_client.h"
+#include "audio_streamer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,14 +22,93 @@ static bool     response_ready  = false;
 static uint8_t* response_buffer = NULL;
 static size_t   response_len    = 0;
 static int      response_sr     = 22050;
+static bool     response_failed = false;
 static bool     response_final  = true;
 static bool     audio_incoming  = false;
 static size_t   audio_expected  = 0;
+static size_t   audio_received  = 0;
+static bool audio_stream_active = false;
 
 static SemaphoreHandle_t response_mutex;
 
 void ws_set_disconnect_callback(ws_disconnect_callback_t callback) {
     disconnect_callback = callback;
+}
+
+bool ws_last_response_failed(void) {
+    bool failed = false;
+
+    if (response_mutex) {
+        xSemaphoreTake(response_mutex, portMAX_DELAY);
+        failed = response_failed;
+        xSemaphoreGive(response_mutex);
+    }
+
+    return failed;
+}
+
+void ws_clear_response_result(void) {
+    if (response_mutex) {
+        xSemaphoreTake(response_mutex, portMAX_DELAY);
+        response_failed = false;
+        xSemaphoreGive(response_mutex);
+    }
+}
+
+bool ws_audio_stream_active(void) {
+    bool active;
+
+    xSemaphoreTake(response_mutex, portMAX_DELAY);
+    active = audio_stream_active;
+    xSemaphoreGive(response_mutex);
+
+    return active;
+}
+
+void ws_clear_audio_stream_active(void) {
+    xSemaphoreTake(response_mutex, portMAX_DELAY);
+    audio_stream_active = false;
+    xSemaphoreGive(response_mutex);
+}
+
+static bool text_looks_like_success_fallback(const char* text) {
+    if (!text) {
+        return false;
+    }
+    
+    return strstr(text, "used direct relay control") ||
+           strstr(text, "using direct relay control") ||
+           strstr(text, "used relay control") ||
+           strstr(text, "controlled it directly") ||
+           strstr(text, "direct relay control") ||
+           strstr(text, "fallback succeeded");
+}
+
+static bool text_looks_like_command_failure(const char* text) {
+    if (!text) {
+        return false;
+    }
+
+    if (text_looks_like_success_fallback(text)) {
+        return false;
+    }
+
+    // Only mark actual failure wording as failure.
+    return strstr(text, "both unreachable") ||
+           strstr(text, "both unavailable") ||
+           strstr(text, "are both unreachable") ||
+           strstr(text, "are both unavailable") ||
+           strstr(text, "could not") ||
+           strstr(text, "couldn't") ||
+           strstr(text, "failed") ||
+           strstr(text, "can't reach") ||
+           strstr(text, "cannot reach") ||
+           strstr(text, "unreachable") ||
+           strstr(text, "not reachable") ||
+           strstr(text, "not available") ||
+           strstr(text, "unable to") ||
+           strstr(text, "target entity is unavailable") ||
+           strstr(text, "target HA entity may be unavailable");
 }
 
 // ── WebSocket event handler ────────────────────────
@@ -83,6 +163,59 @@ static void ws_event_handler(void* arg,
                     cJSON* ab     = cJSON_GetObjectItem(json, "audio_bytes");
                     cJSON* sr     = cJSON_GetObjectItem(json, "sample_rate");
                     cJSON* final  = cJSON_GetObjectItem(json, "final");
+                    cJSON* response_text   = cJSON_GetObjectItem(json, "response");
+                    cJSON* audio_text    = cJSON_GetObjectItem(json, "text");
+                    cJSON* command_success = cJSON_GetObjectItem(json, "command_success");
+                    cJSON* command_result  = cJSON_GetObjectItem(json, "command_result");
+
+                    // Detect online command failure from server metadata/text.
+                    bool detected_failure = false;
+
+                    if (command_success && cJSON_IsBool(command_success)) {
+                        detected_failure = !cJSON_IsTrue(command_success);
+                    }
+
+                    if (command_result && cJSON_IsString(command_result)) {
+                        if (strcmp(command_result->valuestring, "failed") == 0 ||
+                            strcmp(command_result->valuestring, "failure") == 0 ||
+                            strcmp(command_result->valuestring, "error") == 0) {
+                            detected_failure = true;
+                        }
+                    }
+
+                    bool detected_success_fallback = false;
+
+                    if (response_text && cJSON_IsString(response_text)) {
+                        if (text_looks_like_success_fallback(response_text->valuestring)) {
+                            detected_success_fallback = true;
+                        }
+
+                        if (text_looks_like_command_failure(response_text->valuestring)) {
+                            detected_failure = true;
+                        }
+                    }
+
+                    if (audio_text && cJSON_IsString(audio_text)) {
+                        if (text_looks_like_success_fallback(audio_text->valuestring)) {
+                            detected_success_fallback = true;
+                        }
+
+                        if (text_looks_like_command_failure(audio_text->valuestring)) {
+                            detected_failure = true;
+                        }
+                    }
+
+                    if (detected_success_fallback) {
+                        detected_failure = false;
+                    }
+
+                    if (detected_failure) {
+                        xSemaphoreTake(response_mutex, portMAX_DELAY);
+                        response_failed = true;
+                        xSemaphoreGive(response_mutex);
+
+                        ESP_LOGW(TAG, "Server response marked as command failure");
+                    }
 
                     // Server says no valid speech was detected.
                     // Treat this as a completed response with zero audio,
@@ -128,13 +261,15 @@ static void ws_event_handler(void* arg,
                         ESP_LOGW(TAG, "Server error — returning to idle");
                     }
 
-                    // Normal audio response path
+                    // Streaming audio response path
                     else if (ab && cJSON_IsNumber(ab)) {
-                        audio_expected = ab->valueint;
+                        audio_expected = (size_t)ab->valueint;
+                        audio_received = 0;
                         audio_incoming = true;
 
                         xSemaphoreTake(response_mutex, portMAX_DELAY);
 
+                        // Do not allocate a full response_buffer for online streamed audio.
                         if (response_buffer) {
                             free(response_buffer);
                             response_buffer = NULL;
@@ -143,23 +278,40 @@ static void ws_event_handler(void* arg,
                         response_len   = 0;
                         response_ready = false;
 
+                        if (detected_success_fallback) {
+                            response_failed = false;
+                        } else {
+                            response_failed = response_failed || detected_failure;
+                        }
+
                         if (sr && cJSON_IsNumber(sr)) {
                             response_sr = sr->valueint;
                         }
 
-                        if (final) {
+                        if (final && cJSON_IsBool(final)) {
                             response_final = cJSON_IsTrue(final);
-                            } else {
-                                // Old non-streaming protocol is treated as one final chunk.
-                                response_final = true;
+                        } else {
+                            response_final = true;
                         }
 
                         xSemaphoreGive(response_mutex);
 
-                        ESP_LOGI(TAG,
-                            "Expecting %d bytes audio at %d Hz",
+                        // Start audio streaming mode before binary bytes arrive.
+                        // Why:
+                        // The first binary frame should start speaker playback immediately.
+                        audio_streamer_start(response_sr);
+                        xSemaphoreTake(response_mutex, portMAX_DELAY);
+                        audio_stream_active = true;
+                        xSemaphoreGive(response_mutex);
+
+                        ESP_LOGI(
+                            TAG,
+                            "Streaming audio incoming: %zu bytes at %d Hz final=%d failed=%d",
                             audio_expected,
-                            response_sr);
+                            response_sr,
+                            response_final ? 1 : 0,
+                            response_failed ? 1 : 0
+                        );
                     }
 
                     cJSON_Delete(json);
@@ -167,71 +319,71 @@ static void ws_event_handler(void* arg,
                 free(msg);
 
             } else if (data->op_code == 0x02) {
-                // Binary frame — audio response
-                // Accumulate chunks until complete
+                // Binary frame — streamed audio response
                 if (audio_incoming &&
-                    data->data_len > 0) {
+                    data->data_len > 0 &&
+                    data->data_ptr) {
 
-                    xSemaphoreTake(response_mutex,
-                                   portMAX_DELAY);
+                    // Push this binary frame directly into the audio playback queue.
+                    // Why:
+                    // This lets the speaker start while the remaining WebSocket bytes
+                    // are still arriving.
+                    bool pushed = audio_streamer_push(
+                        (const uint8_t*)data->data_ptr,
+                        (size_t)data->data_len,
+                        response_sr
+                    );
 
-                    // First chunk — allocate full buffer
-                    if (!response_buffer &&
-                        audio_expected > 0) {
-                        response_buffer = heap_caps_malloc(
-                                            audio_expected,
-                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-                        if (!response_buffer) {
-                            ESP_LOGW(TAG, "PSRAM response alloc failed, trying internal RAM");
-                            response_buffer = heap_caps_malloc(
-                                                audio_expected,
-                                                MALLOC_CAP_8BIT);
-                        }
-
-                        response_len = 0;
-
-                        if (!response_buffer) {
-                            ESP_LOGE(TAG,
-                                "Failed to alloc "
-                                "%d bytes",
-                                audio_expected);
-                            audio_incoming = false;
-                            xSemaphoreGive(response_mutex);
-                            break;
-                        }
+                    if (!pushed) {
+                        ESP_LOGE(
+                            TAG,
+                            "Failed to push streamed audio frame: %d bytes",
+                            data->data_len
+                        );
+                        break;
                     }
 
-                    // Copy chunk into buffer
-                    if (response_buffer &&
-                        response_len + data->data_len
-                        <= audio_expected) {
-                        memcpy(response_buffer
-                                 + response_len,
-                               data->data_ptr,
-                               data->data_len);
-                        response_len += data->data_len;
+                    audio_received += (size_t)data->data_len;
 
-                        ESP_LOGI(TAG,
-                            "Audio chunk: %d/%d bytes",
-                            response_len,
-                            audio_expected);
+                    if ((audio_received % (32 * 1024)) < (size_t)data->data_len ||
+                        audio_received >= audio_expected) {
 
-                        // Mark ready when all received
-                        if (response_len >=
-                            audio_expected) {
+                        ESP_LOGI(
+                            TAG,
+                            "Streamed audio: received=%zu/%zu final=%d",
+                            audio_received,
+                            audio_expected,
+                            response_final ? 1 : 0
+                        );
+}
+
+                    if (audio_received >= audio_expected) {
+                        audio_incoming = false;
+
+                        // Tell server this TTS chunk is fully received/enqueued.
+                        // Why:
+                        // Server can now send the next TTS chunk while this one is
+                        // still playing from the audio_streamer queue.
+                        ws_send_status("audio_chunk_buffered");
+
+                        if (response_final) {
+                            // Final chunk has been fully enqueued.
+                            // main.c will wait for audio_streamer to finish playback.
+                            audio_streamer_end();
+
+                            xSemaphoreTake(response_mutex, portMAX_DELAY);
+
+                            response_len = 0;
                             response_ready = true;
-                            audio_incoming = false;
-                            ESP_LOGI(TAG,
-                                "Audio complete: "
-                                "%d bytes",
-                                response_len);
+
+                            xSemaphoreGive(response_mutex);
+
+                            ESP_LOGI(TAG, "Final streamed audio chunk enqueued");
+                        } else {
+                            ESP_LOGI(TAG, "Non-final streamed audio chunk enqueued");
                         }
                     }
-
-                    xSemaphoreGive(response_mutex);
                 }
-
             }
             break;
 
@@ -256,7 +408,7 @@ esp_err_t ws_client_init(const char* server_ip,
         .uri                  = uri,
         .reconnect_timeout_ms = 3000,
         .network_timeout_ms   = 15000,
-        .ping_interval_sec    = 15,
+        .ping_interval_sec    = 0,
         .transport            = WEBSOCKET_TRANSPORT_OVER_TCP,
     };
 
@@ -307,7 +459,7 @@ void ws_client_stop(void) {
     audio_incoming = false;
     audio_expected = 0;
     disconnect_notified = false;
-
+    audio_stream_active = false;
     intentional_stop = false;
 }
 
@@ -324,7 +476,9 @@ esp_err_t ws_send_audio(const uint8_t* data,
 
     response_len    = 0;
     audio_expected  = 0;
+    audio_received  = 0;
     audio_incoming  = false;
+    audio_stream_active = false;
     response_ready  = false;
     response_final = true;
 

@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 import os
 import re
+import numpy as np
 
 # Force UTF-8 encoding on Windows
 if sys.platform == "win32":
@@ -39,10 +40,9 @@ stt    = STTEngine()
 llm    = LLMEngine()
 
 tts = TTSEngine(name="main", prewarm=True)
-# Second CPU Kokoro engine for background prefetch.
-# This lets chunk 2 generate while chunk 1 is still generating/playing.
-tts_prefetch = TTSEngine(name="prefetch", prewarm=False)
-TTS_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+# More workers allow future TTS chunks to generate without waiting.
+# Keep this moderate because Kokoro is CPU-heavy.
+TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 memory = MemoryEngine()
 smart_home = SmartHomeEngine()
@@ -66,10 +66,78 @@ connections: dict = {}
 
 TTS_STREAM_TIMEOUT_SEC = 120.0
 TTS_CHUNK_ACK_TIMEOUT_SEC = 90.0
-TTS_SEGMENT_MAX_CHARS = 120
-TTS_SEGMENT_MIN_CHARS = 45
-TTS_SEGMENT_LOOKAHEAD_CHARS = 40
-TTS_READY_QUEUE_SIZE = 6
+
+# Fast Kokoro chunking.
+TTS_SEGMENT_MAX_CHARS = 85
+TTS_SEGMENT_MIN_CHARS = 35
+TTS_SEGMENT_LOOKAHEAD_CHARS = 35
+
+AUDIO_WS_FRAME_BYTES = 16384
+
+TTS_TRIM_THRESHOLD = 280
+TTS_TRIM_KEEP_MS = 45
+
+
+def trim_pcm_silence_edges(
+    audio: bytes,
+    sample_rate: int,
+    trim_start: bool,
+    trim_end: bool,
+    label: str = "tts_trim",
+) -> bytes:
+    """
+    Trim Kokoro's leading/trailing silence from streamed chunks.
+
+    Why:
+    Each Kokoro chunk is generated separately. Kokoro adds tiny silence
+    at chunk starts/ends, which becomes an audible pause between chunks.
+    We keep a small 45ms margin so words don't sound cut.
+    """
+    if not audio or len(audio) < 4:
+        return audio
+
+    even_len = len(audio) - (len(audio) % 2)
+    pcm = np.frombuffer(audio[:even_len], dtype=np.int16)
+
+    if pcm.size == 0:
+        return audio
+
+    abs_pcm = np.abs(pcm.astype(np.int32))
+    speech_indices = np.where(abs_pcm > TTS_TRIM_THRESHOLD)[0]
+
+    if speech_indices.size == 0:
+        return audio
+
+    keep_samples = int(sample_rate * TTS_TRIM_KEEP_MS / 1000)
+
+    start = 0
+    end = pcm.size
+
+    if trim_start:
+        start = max(0, int(speech_indices[0]) - keep_samples)
+
+    if trim_end:
+        end = min(pcm.size, int(speech_indices[-1]) + keep_samples)
+
+    if end <= start:
+        return audio
+
+    trimmed = pcm[start:end]
+
+    # Safety: never return extremely tiny audio by mistake.
+    if trimmed.size < int(sample_rate * 0.12):
+        return audio
+
+    before_ms = pcm.size * 1000 / sample_rate
+    after_ms = trimmed.size * 1000 / sample_rate
+
+    if abs(before_ms - after_ms) > 10:
+        logger.info(
+            f"{label}: trimmed PCM {before_ms:.0f}ms -> {after_ms:.0f}ms "
+            f"start={trim_start} end={trim_end}"
+        )
+
+    return trimmed.astype(np.int16).tobytes()
 
 
 def _bad_tts_boundary(left: str, right: str) -> bool:
@@ -203,6 +271,129 @@ def _find_smart_tts_split(text: str, max_chars: int) -> int:
 
     return max_chars
 
+async def send_single_tts_response(
+    websocket: WebSocket,
+    response_text: str,
+    label: str = "direct_tts_single",
+    command_success: bool = True,
+) -> bool:
+    """
+    Generate and send one full TTS response.
+
+    Why:
+    Direct smart-home replies are short. Splitting them causes unnecessary
+    gaps between chunks.
+    """
+    stream_start = time.perf_counter()
+    loop = asyncio.get_running_loop()
+
+    try:
+        audio_response = await asyncio.wait_for(
+            loop.run_in_executor(
+                TTS_EXECUTOR,
+                tts.synthesize,
+                response_text,
+            ),
+            timeout=TTS_STREAM_TIMEOUT_SEC,
+        )
+
+        # Direct replies should start quickly.
+        # Why:
+        # Kokoro can add small leading silence even for one short response.
+        audio_response = trim_pcm_silence_edges(
+            audio_response,
+            sample_rate=tts.sample_rate,
+            trim_start=True,
+            trim_end=False,
+            label=label,
+        )
+
+        generation_ms = (time.perf_counter() - stream_start) * 1000
+
+        if not audio_response:
+            await websocket.send_json({
+                "status": "error",
+                "message": "TTS produced no audio",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
+            })
+            return False
+
+        await websocket.send_json({
+            "status": "audio_incoming",
+            "audio_bytes": len(audio_response),
+            "sample_rate": tts.sample_rate,
+            "text": response_text,
+            "final": True,
+            "command_success": command_success,
+            "command_result": "ok" if command_success else "failed",
+        })
+
+        sent_ok = await send_audio_pcm_frames(
+            websocket,
+            audio_response,
+            label=label,
+        )
+
+        if not sent_ok:
+            logger.warning(f"{label}: PCM send failed")
+            return False
+
+        await websocket.send_json({
+            "status": "audio_stream_end",
+            "command_success": command_success,
+            "command_result": "ok" if command_success else "failed",
+        })
+
+        logger.info(
+            f"{label}: sent single chunk {len(audio_response)} bytes "
+            f"gen={generation_ms:.0f}ms | '{response_text[:80]}'"
+        )
+
+        return True
+
+    except asyncio.TimeoutError:
+        logger.error(f"{label}: single TTS timed out")
+
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": "TTS timeout",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
+            })
+        except Exception:
+            logger.warning(f"{label}: could not send timeout JSON; socket closed")
+
+        return False
+
+    except WebSocketDisconnect:
+        logger.warning(f"{label}: websocket disconnected during single TTS")
+        return False
+
+    except RuntimeError as e:
+        if "close message" in str(e).lower() or "disconnect" in str(e).lower():
+            logger.warning(f"{label}: websocket closed during single TTS")
+            return False
+
+        logger.error(f"{label}: single TTS runtime error: {e}", exc_info=True)
+        return False
+
+    except Exception as e:
+        logger.error(f"{label}: single TTS error: {e}", exc_info=True)
+
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": "TTS stream error",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
+            })
+        except Exception:
+            logger.warning(f"{label}: could not send error JSON; socket closed")
+
+        return False
+
 
 def _normalize_tts_segment(segment: str, is_final: bool = False) -> str:
     """
@@ -233,29 +424,47 @@ def _normalize_tts_segment(segment: str, is_final: bool = False) -> str:
 
     return segment
 
-def _merge_tiny_final_segment(segments: list[str]) -> list[str]:
+def _merge_tiny_segments(segments: list[str]) -> list[str]:
     """
-    Avoid final fragments like:
-    - 'subwoofer,'
-    - 'I can.'
-    - 'and rear speakers,'
+    Merge tiny TTS fragments anywhere in the response.
+
     """
     if len(segments) < 2:
         return segments
 
-    last = segments[-1].strip()
-    last_words = re.findall(r"[A-Za-z']+", last)
+    merged: list[str] = []
 
-    # Merge tiny final tail into previous chunk.
-    if len(last_words) <= 3 or len(last) < 28:
-        previous = segments[-2].rstrip(" ,")
-        last_clean = last.strip(" ,.")
+    for segment in segments:
+        current = " ".join((segment or "").strip().split())
 
-        merged = f"{previous} {last_clean}".strip()
+        if not current:
+            continue
 
-        return segments[:-2] + [merged]
+        words = re.findall(r"[A-Za-z']+", current)
+        is_tiny = len(words) <= 3 or len(current) < 32
 
-    return segments
+        if is_tiny and merged:
+            previous = merged[-1].rstrip(" ,")
+            current_clean = current.strip(" ,.")
+
+            merged[-1] = f"{previous} {current_clean}".strip()
+            continue
+
+        merged.append(current)
+
+    # Second pass:
+    # If the first segment is tiny, merge it into the next one.
+    if len(merged) >= 2:
+        first_words = re.findall(r"[A-Za-z']+", merged[0])
+
+        if len(first_words) <= 3 or len(merged[0]) < 32:
+            first = merged[0].strip(" ,.")
+            second = merged[1].strip()
+
+            merged[1] = f"{first} {second}".strip()
+            merged = merged[1:]
+
+    return merged
 
 def split_spoken_segments(text: str, max_chars: int = TTS_SEGMENT_MAX_CHARS) -> list[str]:
     """
@@ -304,7 +513,7 @@ def split_spoken_segments(text: str, max_chars: int = TTS_SEGMENT_MAX_CHARS) -> 
             segments.append(remaining)
 
     # Merge broken tiny final chunks before punctuation cleanup.
-    segments = _merge_tiny_final_segment(segments)
+    segments = _merge_tiny_segments(segments)
 
     # Clean punctuation for better speech.
     cleaned = []
@@ -322,9 +531,12 @@ def split_spoken_segments(text: str, max_chars: int = TTS_SEGMENT_MAX_CHARS) -> 
 
 async def wait_for_audio_chunk_ack(websocket: WebSocket) -> bool:
     """
-    Wait until ESP32 confirms it has played the current chunk.
-    This prevents the server from sending the next chunk before the
-    firmware has freed the previous audio buffer.
+    Wait until ESP32 confirms it has buffered/copied the current chunk.
+
+    Why:
+    The ESP32 sends this ACK before playback starts, after it has copied the
+    chunk and freed the WebSocket receive buffer. Then the server can send the
+    next chunk while the current chunk is playing.
     """
     try:
         while True:
@@ -477,29 +689,87 @@ def clean_spoken_response(text: str) -> str:
 
     return cleaned
 
+async def send_audio_pcm_frames(
+    websocket: WebSocket,
+    audio: bytes,
+    label: str,
+) -> bool:
+    """
+    Send PCM audio as WebSocket binary frames.
+
+    Why:
+    If we send one huge binary frame, ESP32 may not start processing until
+    the full frame arrives. Small frames let ESP32 enqueue/play audio while
+    the rest is still being sent.
+    """
+    total = len(audio)
+    sent = 0
+    frame_index = 0
+
+    try:
+        while sent < total:
+            frame = audio[sent:sent + AUDIO_WS_FRAME_BYTES]
+
+            await websocket.send_bytes(frame)
+
+            sent += len(frame)
+            frame_index += 1
+
+            # Small yield keeps the event loop responsive without flooding.
+            await asyncio.sleep(0)
+
+        logger.info(
+            f"{label}: sent PCM in {frame_index} websocket frames "
+            f"({total} bytes)"
+        )
+
+        return True
+
+    except WebSocketDisconnect:
+        logger.warning(
+            f"{label}: ESP32 disconnected while sending PCM "
+            f"at {sent}/{total} bytes"
+        )
+        return False
+
+    except RuntimeError as e:
+        if "close message" in str(e).lower() or "disconnect" in str(e).lower():
+            logger.warning(
+                f"{label}: websocket closed while sending PCM "
+                f"at {sent}/{total} bytes"
+            )
+            return False
+
+        raise
+
+    except Exception as e:
+        logger.error(
+            f"{label}: PCM frame send failed at {sent}/{total}: {e}",
+            exc_info=True,
+        )
+        return False
+
 async def send_streamed_tts_response(
     websocket: WebSocket,
     response_text: str,
     label: str = "tts_stream",
+    command_success: bool = True,
 ) -> bool:
     """
-    Low-latency smooth streamed TTS.
+    Stream TTS with one-chunk-ahead prefetch.
 
-    Goal:
-    - Do NOT delay speech start by waiting for multiple chunks.
-    - Generate chunk 1 and send it immediately.
-    - While ESP32 plays chunk 1, generate future chunks in the background.
-    - Keep ready chunks in a server-side queue.
-    - ESP32 still receives only one chunk ahead safely.
+    This version generates only the next chunk while the current chunk is
+    being sent/played.
     """
-    loop = asyncio.get_running_loop()
     response_text = clean_spoken_response(response_text)
     segments = split_spoken_segments(response_text)
 
     if not segments:
         await websocket.send_json({
             "status": "error",
-            "message": "No text to speak"
+            "message": "No text to speak",
+            "command_success": command_success,
+            "command_result": "ok" if command_success else "failed",
         })
         return False
 
@@ -507,94 +777,71 @@ async def send_streamed_tts_response(
         "status": "audio_stream_start",
         "sample_rate": tts.sample_rate,
         "chunks": len(segments),
+        "command_success": command_success,
+        "command_result": "ok" if command_success else "failed",
     })
 
     logger.info(f"{label}: streaming {len(segments)} TTS chunks")
 
+    loop = asyncio.get_running_loop()
     stream_start = time.perf_counter()
-    ready_queue: asyncio.Queue = asyncio.Queue(maxsize=TTS_READY_QUEUE_SIZE)
 
-    async def synthesize_one(index: int, segment: str) -> dict:
+    async def synthesize_chunk(index: int) -> dict:
+        segment = segments[index]
         chunk_start = time.perf_counter()
 
-        # Chunk 1 uses the main TTS engine.
-        # Later chunks use the prefetch TTS engine.
-        # This allows chunk 2 generation to run in parallel with chunk 1.
-        engine = tts if index == 0 else tts_prefetch
+        logger.info(
+            f"{label}: generating chunk {index + 1}/{len(segments)} | "
+            f"'{segment[:70]}'"
+        )
 
         audio_response = await asyncio.wait_for(
-            loop.run_in_executor(TTS_EXECUTOR, engine.synthesize, segment),
-            timeout=TTS_STREAM_TIMEOUT_SEC
+            loop.run_in_executor(
+                TTS_EXECUTOR,
+                tts.synthesize,
+                segment,
+            ),
+            timeout=TTS_STREAM_TIMEOUT_SEC,
+        )
+
+        # Trim only chunk boundaries.
+        audio_response = trim_pcm_silence_edges(
+            audio_response,
+            sample_rate=tts.sample_rate,
+            trim_start=index > 0,
+            trim_end=index < len(segments) - 1,
+            label=f"{label}_chunk_{index + 1}",
         )
 
         generation_ms = (time.perf_counter() - chunk_start) * 1000
+
+        logger.info(
+            f"{label}: generated chunk {index + 1}/{len(segments)} "
+            f"in {generation_ms:.0f}ms"
+        )
 
         return {
             "index": index,
             "segment": segment,
             "audio": audio_response,
-            "final": index == len(segments) - 1,
             "generation_ms": generation_ms,
+            "final": index == len(segments) - 1,
         }
 
-    async def producer_from_second_chunk():
-        """
-        Generate remaining chunks continuously in the background.
-        This does not delay the first spoken chunk.
-        """
-        try:
-            for index in range(1, len(segments)):
-                segment = segments[index]
-
-                try:
-                    item = await synthesize_one(index, segment)
-
-                    logger.info(
-                        f"{label}: prefetched chunk {index + 1}/{len(segments)} "
-                        f"in {item['generation_ms']:.0f}ms | '{segment[:60]}'"
-                    )
-
-                    await ready_queue.put(item)
-
-                except asyncio.TimeoutError:
-                    logger.error(f"{label}: TTS chunk {index + 1} timed out")
-                    await ready_queue.put({
-                        "error": "TTS chunk timeout",
-                        "index": index,
-                    })
-                    return
-
-                except Exception as e:
-                    logger.error(
-                        f"{label}: TTS chunk {index + 1} failed: {e}",
-                        exc_info=True
-                    )
-                    await ready_queue.put({
-                        "error": str(e),
-                        "index": index,
-                    })
-                    return
-
-        except asyncio.CancelledError:
-            logger.info(f"{label}: TTS prefetch producer cancelled")
-            raise
-
     async def send_chunk(item: dict) -> bool:
-        if item.get("error"):
-            await websocket.send_json({
-                "status": "error",
-                "message": item["error"]
-            })
-            return False
-
         index = item["index"]
         segment = item["segment"]
         audio_response = item["audio"]
         is_final = item["final"]
 
         if not audio_response:
-            logger.warning(f"{label}: empty TTS chunk {index + 1}")
-            return True
+            await websocket.send_json({
+                "status": "error",
+                "message": "TTS produced no audio",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
+            })
+            return False
 
         send_start = time.perf_counter()
 
@@ -607,133 +854,161 @@ async def send_streamed_tts_response(
             "audio_bytes": len(audio_response),
             "sample_rate": tts.sample_rate,
             "text": segment,
+            "command_success": command_success,
+            "command_result": "ok" if command_success else "failed",
         })
 
-        await websocket.send_bytes(audio_response)
+        sent_ok = await send_audio_pcm_frames(
+            websocket,
+            audio_response,
+            label=label,
+        )
+
+        if not sent_ok:
+            logger.warning(
+                f"{label}: stopping stream because PCM send failed"
+            )
+            return False
 
         send_ms = (time.perf_counter() - send_start) * 1000
 
         logger.info(
             f"{label}: sent chunk {index + 1}/{len(segments)} "
             f"{len(audio_response)} bytes in {send_ms:.0f}ms "
-            f"gen={item['generation_ms']:.0f}ms | '{segment[:60]}'"
+            f"gen={item['generation_ms']:.0f}ms"
         )
 
         ack_ok = await wait_for_audio_chunk_ack(websocket)
 
         if not ack_ok:
+            logger.warning(
+                f"{label}: ESP32 did not ACK chunk "
+                f"{index + 1}/{len(segments)}"
+            )
             return False
 
         return True
 
-    producer_task = None
-    sent_any_audio = False
-
     try:
-        # Start prefetching future chunks immediately.
-        # This begins chunk 2 generation while chunk 1 is still being generated.
-        if len(segments) > 1:
-            producer_task = asyncio.create_task(producer_from_second_chunk())
+        # Generate chunk 1 first.
+        # Why:
+        # This keeps first speech latency fast.
+        current_item = await synthesize_chunk(0)
 
-        # Generate first chunk with the main engine.
-        # Speech still starts as soon as chunk 1 is ready.
-        first_item = await synthesize_one(0, segments[0])
+        for index in range(len(segments)):
+            next_index = index + 1
 
-        logger.info(
-            f"{label}: first chunk ready in "
-            f"{first_item['generation_ms']:.0f}ms"
-        )
-
-        ok = await send_chunk(first_item)
-
-        if not ok:
-            if producer_task:
-                producer_task.cancel()
-            return False
-
-        sent_any_audio = bool(first_item.get("audio"))
-
-        # Send remaining chunks in order.
-        # Usually they will already be waiting in ready_queue.
-        for expected_index in range(1, len(segments)):
-            item = await ready_queue.get()
-
-            if item.get("index") != expected_index:
-                logger.warning(
-                    f"{label}: chunk order mismatch. "
-                    f"expected={expected_index}, got={item.get('index')}"
+            # Start generating the next chunk BEFORE sending the current chunk.
+            if next_index < len(segments):
+                logger.info(
+                    f"{label}: starting background generation for chunk "
+                    f"{next_index + 1}/{len(segments)} before sending chunk {index + 1}"
                 )
 
-            ok = await send_chunk(item)
+                next_task = asyncio.create_task(
+                    synthesize_chunk(next_index)
+                )
+            else:
+                next_task = None
+
+            ok = await send_chunk(current_item)
 
             if not ok:
-                if producer_task:
-                    producer_task.cancel()
+                if next_task:
+                    next_task.cancel()
                 return False
 
-            if item.get("audio"):
-                sent_any_audio = True
+            if next_task:
+                if not next_task.done():
+                    logger.warning(
+                        f"{label}: next chunk {next_index + 1}/{len(segments)} "
+                        "was still not ready after current chunk was sent"
+                    )
 
-        if producer_task:
-            await producer_task
+                current_item = await next_task
 
         await websocket.send_json({
-            "status": "audio_stream_end"
+            "status": "audio_stream_end",
+            "command_success": command_success,
+            "command_result": "ok" if command_success else "failed",
         })
 
         total_ms = (time.perf_counter() - stream_start) * 1000
         logger.info(f"{label}: stream complete in {total_ms:.0f}ms")
 
-        if not sent_any_audio:
+        return True
+    
+    except asyncio.TimeoutError:
+        logger.error(f"{label}: TTS chunk timed out")
+
+        try:
             await websocket.send_json({
                 "status": "error",
-                "message": "TTS produced no audio"
+                "message": "TTS timeout",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
             })
+        except Exception:
+            logger.warning(
+                f"{label}: could not send timeout JSON; socket already closed"
+            )
+
+        return False
+
+    except WebSocketDisconnect:
+        logger.warning(f"{label}: websocket disconnected during TTS stream")
+        return False
+
+    except RuntimeError as e:
+        if "close message" in str(e).lower() or "disconnect" in str(e).lower():
+            logger.warning(f"{label}: websocket closed during TTS stream")
             return False
 
-        return True
-
-    except asyncio.TimeoutError:
-        logger.error(f"{label}: first TTS chunk timed out")
-        await websocket.send_json({
-            "status": "error",
-            "message": "TTS timeout"
-        })
-
-        if producer_task:
-            producer_task.cancel()
-
+        logger.error(f"{label}: streamed TTS runtime error: {e}", exc_info=True)
         return False
 
     except Exception as e:
         logger.error(f"{label}: streamed TTS error: {e}", exc_info=True)
 
-        await websocket.send_json({
-            "status": "error",
-            "message": "TTS stream error"
-        })
-
-        if producer_task:
-            producer_task.cancel()
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": "TTS stream error",
+                "command_success": command_success,
+                "command_result": "ok" if command_success else "failed",
+            })
+        except Exception:
+            logger.warning(
+                f"{label}: could not send error JSON; socket already closed"
+            )
 
         return False
-
-async def send_direct_voice_response(websocket: WebSocket,
-                                     response_text: str):
+    
+    
+async def send_direct_voice_response(
+    websocket: WebSocket,
+    response_text: str,
+    command_success: bool = True,
+):
     """
-    Streamed TTS response.
-    Used for smart-home commands that skip the LLM.
+    Send a direct short voice response.
+
+    Why:
+    Smart-home replies are short. They should use one TTS chunk.
     """
     await websocket.send_json({
-        "status":   "processing",
-        "stage":    "speaking",
-        "response": response_text
+        "status": "processing",
+        "stage": "speaking",
+        "response": response_text,
+        "command_success": command_success,
+        "command_result": "ok" if command_success else "failed",
     })
 
-    await send_streamed_tts_response(
+    await send_single_tts_response(
         websocket,
         response_text,
-        label="direct_tts_stream"
+        label="direct_tts_single",
+        command_success=command_success,
     )
 
 async def try_smart_home_command(websocket: WebSocket,
@@ -778,28 +1053,35 @@ async def try_smart_home_command(websocket: WebSocket,
     )
 
     await websocket.send_json({
-        "status":     "processing",
-        "stage":      "command",
-        "transcript": transcript,
-        "response":   result.response
-    })
+    "status":          "processing",
+    "stage":           "command",
+    "transcript":      transcript,
+    "response":        result.response,
+    "command_success": result.success,
+    "command_result":  "ok" if result.success else "failed",
+    })      
 
-    await send_direct_voice_response(websocket, result.response)
+    await send_direct_voice_response(
+        websocket,
+        result.response,
+        command_success=result.success,
+    )
     return True
 
 async def run_pipeline(websocket: WebSocket,
                        client_id: int,
                        transcript: str):
     """
-    LLM → TTS → send audio.
-    Called from both the audio path and text_inject path.
-    Raises asyncio.TimeoutError on slow LLM/TTS so the
-    caller can handle it cleanly.
+    LLM -> streamed TTS -> send audio.
+
+    Why:
+    This function is for normal conversation.
+    It should not use smart-home command_success variables.
     """
     loop = asyncio.get_running_loop()
     pipeline_start = time.perf_counter()
 
-    # Recall relevant memories
+    # ── Memory ─────────────────────────────────────
     mem_start = time.perf_counter()
 
     memories = memory.recall_memory(transcript)
@@ -809,18 +1091,24 @@ async def run_pipeline(websocket: WebSocket,
 
     if memories:
         connections[client_id].append({
-            "role":    "system",
-            "content": "Relevant context: " + " | ".join(memories)
+            "role": "system",
+            "content": "Relevant context: " + " | ".join(memories),
         })
 
     # ── LLM ───────────────────────────────────────
     history = connections[client_id]
+
     try:
         llm_start = time.perf_counter()
 
         response = await asyncio.wait_for(
-            loop.run_in_executor(None, llm.chat, transcript, history),
-            timeout=60.0
+            loop.run_in_executor(
+                None,
+                llm.chat,
+                transcript,
+                history,
+            ),
+            timeout=60.0,
         )
 
         response = clean_spoken_response(response)
@@ -831,48 +1119,78 @@ async def run_pipeline(websocket: WebSocket,
 
     except asyncio.TimeoutError:
         logger.error("LLM timed out")
-        await websocket.send_json({
-            "status":  "error",
-            "message": "LLM timeout — please try again"
-        })
+
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": "Thinking timed out. Please try again.",
+            })
+        except Exception:
+            logger.warning("Could not send LLM timeout JSON; socket already closed")
+
         return
 
-    # Update conversation history
-    connections[client_id].append(
-        {"role": "user",      "content": transcript})
-    connections[client_id].append(
-        {"role": "assistant", "content": response})
+    except WebSocketDisconnect:
+        logger.warning("WebSocket disconnected during LLM stage")
+        return
+
+    except Exception as e:
+        logger.error(f"LLM error: {e}", exc_info=True)
+
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": "I had trouble thinking through that.",
+            })
+        except Exception:
+            logger.warning("Could not send LLM error JSON; socket already closed")
+
+        return
+
+    # ── Conversation history ───────────────────────
+    connections[client_id].append({
+        "role": "user",
+        "content": transcript,
+    })
+
+    connections[client_id].append({
+        "role": "assistant",
+        "content": response,
+    })
+
     if len(connections[client_id]) > 20:
         connections[client_id] = connections[client_id][-20:]
 
-    memory.log_conversation("user",      transcript)
+    memory.log_conversation("user", transcript)
     memory.log_conversation("assistant", response)
 
-    await websocket.send_json({
-        "status":   "processing",
-        "stage":    "speaking",
-        "response": response
-    })
-
-    # ── TTS ───────────────────────────────────────
+    # ── Tell ESP32 speaking stage is starting ───────
     try:
-        
-        await send_streamed_tts_response(
-            websocket,
-            response,
-            label="llm_tts_stream"
-        )
-
-        total_ms = (time.perf_counter() - pipeline_start) * 1000
-        logger.info(f"Timing: pipeline_total={total_ms:.0f}ms")
-    
-    except asyncio.TimeoutError:
-        logger.error("TTS timed out")
         await websocket.send_json({
-            "status":  "error",
-            "message": "TTS timeout — please try again"
+            "status": "processing",
+            "stage": "speaking",
+            "response": response,
+            "command_success": True,
+            "command_result": "ok",
         })
+    except Exception:
+        logger.warning("Could not send speaking JSON; socket already closed")
         return
+
+    # ── TTS streaming ──────────────────────────────
+    ok = await send_streamed_tts_response(
+        websocket,
+        response,
+        label="llm_tts_stream",
+        command_success=True,
+    )
+
+    if not ok:
+        logger.warning("LLM TTS stream did not complete cleanly")
+        return
+
+    total_ms = (time.perf_counter() - pipeline_start) * 1000
+    logger.info(f"Timing: pipeline_total={total_ms:.0f}ms")
 
 
 @app.websocket("/zyra")
@@ -975,36 +1293,17 @@ async def zyra_websocket(websocket: WebSocket):
 
                     if msg.get("value") == "test_query":
                         logger.info("Test query received")
-                        test_response = ("ZYRA is online and connected. "
-                                         "The pipeline is working.")
-                        loop = asyncio.get_running_loop()
 
-                        await websocket.send_json({
-                            "status":   "processing",
-                            "stage":    "speaking",
-                            "response": test_response
-                        })
+                        test_response = (
+                            "ZYRA is online and connected. "
+                            "The pipeline is working."
+                        )
 
-                        try:
-                            audio_response = await asyncio.wait_for(
-                                loop.run_in_executor(
-                                    None, tts.synthesize, test_response),
-                                timeout=120.0
-                            )
-                        except asyncio.TimeoutError:
-                            logger.error("TTS timed out on test query")
-                            continue
-
-                        if audio_response:
-                            await websocket.send_json({
-                                "status":      "audio_incoming",
-                                "audio_bytes": len(audio_response),
-                                "sample_rate": tts.sample_rate
-                            })
-                            await websocket.send_bytes(audio_response)
-                            logger.info("Test audio sent")
-                        else:
-                            logger.error("TTS failed for test query")
+                        await send_direct_voice_response(
+                            websocket,
+                            test_response,
+                            command_success=True,
+                        )
 
     except WebSocketDisconnect:
         logger.info(f"Client disconnected — {client_id}")
@@ -1072,11 +1371,12 @@ async def smart_home_health():
 # ── Run server ────────────────────────────────────
 if __name__ == "__main__":
     logger.info(f"ZYRA server starting on ws://{HOST}:{PORT}")
+
     uvicorn.run(
         app,
         host=HOST,
         port=PORT,
         reload=False,
-        ws_ping_interval=60,
-        ws_ping_timeout=120
+
+        ws="wsproto",
     )

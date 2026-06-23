@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "audio_pipeline.c"
+        "audio_streamer.c"
         "websocket_client.c"
         "display.c"
         "smart_home_control.c"

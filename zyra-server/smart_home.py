@@ -26,7 +26,7 @@ class SmartHomeResult:
     action: str = ""
     devices: Optional[list[str]] = None
     backend: str = ""
-
+    success: bool = True
 
 class SmartHomeEngine:
     """
@@ -163,6 +163,126 @@ class SmartHomeEngine:
                 "available": relay_available,
             },
         }
+    
+    def _first_unavailable_ha_devices(
+        self,
+        commands: list[RoutedCommand],
+    ) -> list[str]:
+        """
+        Return devices whose HA entities are unavailable/unknown.
+
+        Why:
+        If HA is alive but a target entity is unavailable, the problem is the
+        physical target/integration, not Home Assistant itself.
+        """
+        unavailable: list[str] = []
+
+        for command in commands:
+            for device in self._expand_devices(command.devices):
+                if self.ha.entity_is_unavailable(device):
+                    if device not in unavailable:
+                        unavailable.append(device)
+
+        return unavailable
+    
+    def _ha_entity_unavailable_response(self, devices: list[str]) -> str:
+        """
+        Build a truthful response when HA is reachable but the target HA
+        entity/entities are unavailable.
+
+        """
+        clean_devices = self._expand_devices(devices)
+
+        if not clean_devices:
+            return (
+                "I can reach Home Assistant, but the target device is unavailable."
+            )
+
+        relay_backed_devices = {
+            "tv",
+            "soundbar",
+            "subwoofer",
+            "rear",
+        }
+
+        all_are_relay_backed = all(
+            device in relay_backed_devices
+            for device in clean_devices
+        )
+
+        target_name = self._friendly_target_name(clean_devices)
+
+        if all_are_relay_backed:
+            return (
+                f"I can reach Home Assistant, but I can't reach the smart relay board "
+                f"for {target_name}."
+            )
+
+        labels = [
+            self.devices[device]["label"]
+            for device in clean_devices
+            if device in self.devices
+        ]
+
+        if not labels:
+            return (
+                "I can reach Home Assistant, but the target device is unavailable."
+            )
+
+        if len(labels) == 1:
+            label = labels[0]
+            plural = self.devices[clean_devices[0]].get("plural", False)
+            verb = "are" if plural else "is"
+
+            return (
+                f"I can reach Home Assistant, but {label} {verb} unavailable right now."
+            )
+
+        joined = self._join_sentence_parts(labels)
+
+        return (
+            f"I can reach Home Assistant, but these devices are unavailable right now: "
+            f"{joined}."
+        )
+    
+    def _friendly_target_name(self, devices: list[str]) -> str:
+        """
+        Convert device sets into natural group names.
+
+        Why:
+        If the user asked for a grouped command, Zyra should say
+        'sound system' or 'home theater' instead of listing every relay.
+        """
+        clean = set(devices)
+
+        if clean == {"tv"}:
+            return "the TV"
+
+        if clean == {"soundbar"}:
+            return "the soundbar"
+
+        if clean == {"subwoofer"}:
+            return "the subwoofer"
+
+        if clean == {"rear"}:
+            return "the rear speakers"
+
+        if clean == {"soundbar", "subwoofer"}:
+            return "the sound system"
+
+        if clean == {"soundbar", "subwoofer", "rear"}:
+            return "the speaker system"
+
+        if clean == {"tv", "soundbar", "subwoofer", "rear"}:
+            return "the home theater system"
+
+        # Mixed custom set fallback.
+        names = self._format_device_list(devices)
+
+        if not names:
+            return "the target device"
+
+        return names
 
     # ── Control handling ───────────────────────────
 
@@ -175,8 +295,10 @@ class SmartHomeEngine:
                 "I understood it as a smart-home command, but no valid device was found.",
             )
 
-        # Mode 1: try Home Assistant first.
-        if self.ha.get_status() is not None:
+        # Mode 1: try Home Assistant if the HA hub is reachable.
+        ha_available = self.ha.is_available()
+
+        if ha_available:
             if self._execute_commands_on_backend(
                 backend=SmartHomeBackend.HOME_ASSISTANT,
                 commands=commands,
@@ -190,7 +312,24 @@ class SmartHomeEngine:
                     backend=self.active_backend.value,
                 )
 
-            logger.warning("Home Assistant command path failed. Trying relay fallback.")
+            # HA hub is reachable, but command failed.
+            # This usually means the requested HA entity/device is unavailable.
+            failed_devices = self._first_unavailable_ha_devices(commands)
+
+            if failed_devices:
+                self.active_backend = SmartHomeBackend.HOME_ASSISTANT
+                return SmartHomeResult(
+                    True,
+                    self._ha_entity_unavailable_response(failed_devices),
+                    action=commands[0].action,
+                    devices=failed_devices,
+                    backend=self.active_backend.value,
+                    success=False,
+                )
+
+            logger.warning(
+                "Home Assistant hub is reachable, but HA command path failed. Trying relay fallback."
+            )
 
         # Mode 2: fallback to ESP8266 home IP.
         if self._execute_commands_on_backend(
@@ -213,12 +352,24 @@ class SmartHomeEngine:
 
         self.active_backend = SmartHomeBackend.NONE
 
+        if ha_available:
+            response = (
+                "I can reach Home Assistant, but smart relay board is unreachable "
+                "and the target device command failed."
+            )
+        else:
+            response = (
+                "I understood the device command, but Home Assistant and the smart relay board "
+                "are both unreachable."
+            )
+
         return SmartHomeResult(
             True,
-            "I understood the device command, but Home Assistant and the relay board are both unreachable.",
+            response,
             action=commands[0].action,
             devices=commands[0].devices,
             backend=self.active_backend.value,
+            success=False,
         )
 
     def _execute_commands_on_backend(
@@ -292,6 +443,7 @@ class SmartHomeEngine:
                 True,
                 "I could not read the smart-home status. Home Assistant and the relay board are both unreachable.",
                 backend=SmartHomeBackend.NONE.value,
+                success=False,
             )
 
         devices = self._expand_devices(requested_devices or ["all"])

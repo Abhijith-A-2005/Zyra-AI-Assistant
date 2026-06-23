@@ -4,7 +4,8 @@ from typing import Optional
 import requests
 
 logger = logging.getLogger(__name__)
-
+HA_STATE_NOT_FOUND = "__not_found__"
+HA_STATE_REQUEST_FAILED = "__request_failed__"
 
 class HomeAssistantClient:
     """
@@ -88,6 +89,14 @@ class HomeAssistantClient:
             if state == "off":
                 return False
 
+            if state in {"unavailable", "unknown"}:
+                logger.warning(
+                    "Home Assistant target entity unavailable for %s: %s",
+                    entity_id,
+                    state,
+                )
+                return None
+
             logger.warning(
                 "Unsupported Home Assistant state for %s: %s",
                 entity_id,
@@ -102,13 +111,101 @@ class HomeAssistantClient:
                 e,
             )
             return None
+        
+    def get_raw_state(self, device: str) -> Optional[str]:
+        """
+        Return raw Home Assistant state.
+
+        """
+        entity_id = self.entities.get(device)
+
+        if not entity_id:
+            logger.error("No Home Assistant entity configured for %s", device)
+            return HA_STATE_NOT_FOUND
+
+        try:
+            response = self.session.get(
+                f"{self.base_url}/api/states/{entity_id}",
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+
+            if response.status_code == 404:
+                logger.error("Home Assistant entity not found: %s", entity_id)
+                return HA_STATE_NOT_FOUND
+
+            response.raise_for_status()
+            return response.json().get("state")
+
+        except requests.RequestException as e:
+            logger.warning(
+                "Home Assistant raw state failed for %s: %s",
+                entity_id,
+                e,
+            )
+            return HA_STATE_REQUEST_FAILED
+        
+    def _wait_for_expected_state(
+        self,
+        device: str,
+        expected_state: str,
+        attempts: int = 5,
+        delay_sec: float = 0.35,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Wait briefly for HA state update after service call.
+
+        """
+        import time
+
+        last_state: Optional[str] = None
+
+        for attempt in range(1, attempts + 1):
+            state = self.get_raw_state(device)
+            last_state = state
+
+            if state == expected_state:
+                return True, state
+
+            if state in {
+                HA_STATE_NOT_FOUND,
+                HA_STATE_REQUEST_FAILED,
+                "unavailable",
+                "unknown",
+                None,
+            }:
+                return False, state
+
+            logger.info(
+                "Waiting for HA state update for %s: attempt %d/%d state=%s expected=%s",
+                device,
+                attempt,
+                attempts,
+                state,
+                expected_state,
+            )
+
+            time.sleep(delay_sec)
+
+        return False, last_state
+        
+    def entity_is_unavailable(self, device: str) -> bool:
+        """
+        True when HA is reachable but the target entity reports unavailable/unknown.
+
+        Why:
+        This usually means the physical device/integration behind HA is offline,
+        not that Home Assistant itself is down.
+        """
+        state = self.get_raw_state(device)
+        return state in {"unavailable", "unknown"}
 
     def get_status(self) -> Optional[dict[str, Optional[bool]]]:
         """
         Return state map:
-            {"tv": True, "soundbar": False, ...}
+            {"tv": True, "soundbar": False, "subwoofer": None, ...}
 
-        Returns None only if HA is completely unavailable.
+        Return None only if Home Assistant itself is unreachable.
         """
         if not self.configured:
             logger.warning("Home Assistant is not configured")
@@ -120,11 +217,26 @@ class HomeAssistantClient:
         states: dict[str, Optional[bool]] = {}
 
         for device in self.entities:
-            states[device] = self.get_state(device)
+            raw_state = self.get_raw_state(device)
 
-        # If every entity failed, treat HA backend as unusable.
-        if all(value is None for value in states.values()):
-            return None
+            if raw_state == "on":
+                states[device] = True
+            elif raw_state == "off":
+                states[device] = False
+            elif raw_state in {"unavailable", "unknown"}:
+                logger.warning(
+                    "Home Assistant target entity unavailable for %s: %s",
+                    self.entities[device],
+                    raw_state,
+                )
+                states[device] = None
+            else:
+                logger.warning(
+                    "Unsupported Home Assistant state for %s: %s",
+                    self.entities[device],
+                    raw_state,
+                )
+                states[device] = None
 
         return states
 
@@ -147,9 +259,11 @@ class HomeAssistantClient:
             logger.error("Unsupported Home Assistant action: %s", action)
             return False
 
+        domain = entity_id.split(".", 1)[0]
+
         try:
             response = self.session.post(
-                f"{self.base_url}/api/services/switch/{service}",
+                f"{self.base_url}/api/services/{domain}/{service}",
                 headers=self._headers(),
                 json={"entity_id": entity_id},
                 timeout=self.timeout,
@@ -165,10 +279,62 @@ class HomeAssistantClient:
                 )
                 return False
 
+            if action in {"on", "off"}:
+                ok, final_state = self._wait_for_expected_state(
+                    device=device,
+                    expected_state=action,
+                    attempts=5,
+                    delay_sec=0.35,
+                )
+
+                if final_state == HA_STATE_NOT_FOUND:
+                    logger.error(
+                        "Home Assistant accepted command, but target entity does not exist: %s",
+                        entity_id,
+                    )
+                    return False
+
+                if final_state == HA_STATE_REQUEST_FAILED:
+                    logger.error(
+                        "Home Assistant accepted command, but state verification failed: %s",
+                        entity_id,
+                    )
+                    return False
+
+                if final_state in {"unavailable", "unknown", None}:
+                    logger.error(
+                        "Home Assistant accepted command, but target entity is %s: %s",
+                        final_state,
+                        entity_id,
+                    )
+                    return False
+
+                if not ok:
+                    logger.error(
+                        "Home Assistant accepted command, but state did not confirm: %s expected=%s last_state=%s",
+                        entity_id,
+                        action,
+                        final_state,
+                    )
+
+                    return False
+
+            elif action == "toggle":
+                final_state = self.get_raw_state(device)
+
+                if final_state in {"unavailable", "unknown"}:
+                    logger.error(
+                        "Home Assistant accepted toggle, but target entity is %s: %s",
+                        final_state,
+                        entity_id,
+                    )
+                    return False
+
             logger.info(
-                "Home Assistant command OK: %s %s",
+                "Home Assistant command OK: %s %s final_state=%s",
                 service,
                 entity_id,
+                final_state,
             )
             return True
 
