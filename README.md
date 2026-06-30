@@ -4,9 +4,11 @@ ZYRA is a custom local smart-home voice assistant built using an **ESP32-S3** an
 
 The ESP32-S3 captures voice using an INMP441 microphone, sends the audio to the local AI server through WebSocket, understands speech using Faster-Whisper, generates intelligent responses through Ollama, converts replies into speech using Kokoro TTS with the `af_heart` voice, and plays them back through a MAX98357 I2S amplifier.
 
-The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, provide RGB LED feedback, wake through a local hardware wakeword, and intelligently understand smart-home commands such as turning devices on, turning devices off, checking device status, and controlling grouped home-theater devices without depending on cloud assistants.
+The goal of ZYRA is to become a private Jarvis-style home assistant that can talk naturally, remember useful context, show system states on an OLED display, provide RGB LED feedback, wake through a local hardware wakeword, and intelligently control smart-home devices without depending on cloud assistants.
 
-The physical relay-board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, RGB status LED feedback, and serverless relay fallback support.
+ZYRA now includes Smart-device control which can control volume levels, media playback, change TV and soundbar inputs, TV app launching, change soundbar sound modes, and tell detailed device status. This allows commands such as changing the TV to HDMI 1, opening Netflix, returning to the Google TV home screen, setting the LG Soundbar to Cinema mode, checking home-theater status, or controlling grouped devices through natural language.
+
+The physical relay-board firmware is maintained in a separate Smart-Switch-Board repository, while this repository contains the ZYRA assistant brain, smart-home intelligence layer, ESP32-S3 voice interface, local wakeword firmware, offline voice command layer, SPIFFS prompt assets, RGB status LED feedback, Home Assistant integration, direct relay fallback, serverless Home Assistant control, serverless relay control, and emergency offline relay fallback support.
 
 ---
 
@@ -25,13 +27,19 @@ ZYRA/
 │   ├── llm.py
 │   ├── tts.py
 │   ├── memory.py
-│   ├── intent_router.py
+│   ├── device_registry.json
+│   ├── device_registry.py
+│   ├── registry_intent_router.py
+│   ├── ha_service_mapper.py
 │   ├── smart_home.py
 │   ├── smart_home_backends.py
 │   ├── home_assistant_client.py
 │   ├── relay_http_client.py
 │   ├── requirements.txt
 │   ├── test_components.py
+│   ├── test_device_registry.py
+│   ├── test_registry_intent_router.py
+│   ├── test_registry_live.py
 │   ├── test_home_assistant.py
 │   ├── test_tts_api.py
 │   └── test_websocket.py
@@ -101,40 +109,50 @@ It handles:
 * Kokoro TTS using the `af_heart` voice
 * Streamed PCM audio delivery to the ESP32-S3
 * Memory using ChromaDB and SQLite
-* Smart-home intent routing
-* Home Assistant REST control
+* Capability-aware smart-home device registry
+* Semantic registry intent routing
+* Home Assistant service mapping
+* Detailed smart-device control through Home Assistant
+* Relay/mains power control through Home Assistant switch entities
 * Direct ESP8266 relay-board HTTP fallback
+* Smart device status reporting
 * Health endpoint for runtime mode decisions
 * Smart-home backend health/debug checks
 * WebSocket test client and component test scripts
 
 Important files:
 
-| File                       | Purpose                                                                                 |
-| -------------------------- | --------------------------------------------------------------------------------------- |
-| `main.py`                  | Main FastAPI/WebSocket server, AI pipeline, streamed TTS, and runtime response handling |
-| `stt.py`                   | Faster-Whisper speech recognition and hallucination filtering                           |
-| `llm.py`                   | Ollama chat engine                                                                      |
-| `tts.py`                   | Kokoro TTS engine using `af_heart`                                                      |
-| `intent_router.py`         | Smart-home intent routing and deterministic command parsing                             |
-| `smart_home.py`            | Smart-home command execution and response generation                                    |
-| `smart_home_backends.py`   | Backend result models for Home Assistant and relay fallback                             |
-| `home_assistant_client.py` | Home Assistant REST client and entity state verification                                |
-| `relay_http_client.py`     | ESP8266 relay-board HTTP client                                                         |
-| `memory.py`                | ChromaDB and SQLite memory handling                                                     |
-| `test_components.py`       | Tests Ollama, Whisper, Kokoro TTS, and memory                                           |
-| `test_home_assistant.py`   | Tests Home Assistant and relay fallback backend availability                            |
-| `test_tts_api.py`          | Generates a Kokoro TTS test WAV                                                         |
-| `test_websocket.py`        | Simulates the ESP32-S3 WebSocket client from the PC                                     |
+| File                        | Purpose                                                                                           |
+| --------------------------- | ------------------------------------------------------------------------------------------------- |
+| `main.py`                   | Main FastAPI/WebSocket server, AI pipeline, streamed TTS, smart-home routing, and response handling |
+| `stt.py`                    | Faster-Whisper speech recognition and hallucination filtering                                     |
+| `llm.py`                    | Ollama chat engine                                                                                |
+| `tts.py`                    | Kokoro TTS engine using `af_heart`                                                                |
+| `device_registry.json`      | Capability-aware smart-home registry containing devices, aliases, groups, surfaces, sources, and sound modes |
+| `device_registry.py`        | Loads the device registry and resolves spoken targets/capabilities to the correct control surface |
+| `registry_intent_router.py` | Semantic smart-home router that converts natural language into registry-safe commands             |
+| `ha_service_mapper.py`      | Converts registry commands into Home Assistant service calls                                      |
+| `smart_home.py`             | Smart-home command execution, Home Assistant control, relay fallback, status reporting, and response generation |
+| `smart_home_backends.py`    | Backend result models for Home Assistant and relay fallback                                       |
+| `home_assistant_client.py`  | Home Assistant REST client, entity state reading, service calls, and verification                 |
+| `relay_http_client.py`      | ESP8266 relay-board HTTP client                                                                   |
+| `memory.py`                 | ChromaDB and SQLite memory handling                                                               |
+| `test_components.py`        | Tests Ollama, Whisper, Kokoro TTS, and memory                                                     |
+| `test_device_registry.py`   | Tests registry target resolution, capability mapping, and Home Assistant service mapping          |
+| `test_registry_intent_router.py` | Tests semantic smart-home routing and verifies registry-safe command output                 |
+| `test_registry_live.py`     | Runs safe live registry control tests against Home Assistant                                      |
+| `test_home_assistant.py`    | Tests Home Assistant and relay fallback backend availability                                      |
+| `test_tts_api.py`           | Generates a Kokoro TTS test WAV                                                                   |
+| `test_websocket.py`         | Simulates the ESP32-S3 WebSocket client from the PC                                               |
 
 Current server-side smart-home modes:
 
 ```text
 Mode 1 — Online Intelligent HA Mode
-ESP32-S3 → ZYRA Server → Home Assistant → MQTT → ESP8266 relay board
+ESP32-S3 → ZYRA Server → Registry Router → Device Registry → Home Assistant → MQTT / smart-device integrations
 
 Mode 2 — Online Intelligent Relay Mode
-ESP32-S3 → ZYRA Server → ESP8266 relay board home IP
+ESP32-S3 → ZYRA Server → Registry Router → ESP8266 relay board home IP
 ```
 
 Mode 1 is preferred when Home Assistant is available.
@@ -208,6 +226,10 @@ This version includes refinements to make ZYRA feel more stable and appliance-li
 Current refinements include:
 
 * Complete 5-mode smart-home runtime architecture
+* Capability-aware server-side device registry
+* Semantic registry router for natural smart-home commands
+* Multi-surface Home Assistant control for TV and soundbar
+* Detailed Home Assistant status reporting for TV and soundbar
 * Online Intelligent HA Mode using Home Assistant as the preferred backend
 * Online Intelligent Relay Mode when Home Assistant is unavailable but the ZYRA server is online
 * Serverless HA Mode when the ZYRA server is unavailable but Home Assistant is reachable
@@ -317,49 +339,274 @@ SPIFFS WAV prompt confirms result
 
 ## Smart Home Intelligence
 
-ZYRA can understand smart-home commands in natural language.
+ZYRA can understand smart-home commands in natural language using a capability-aware server-side device registry.
 
-Controlled devices:
+The current model is not:
 
-| Device        | Internal ID |
-| ------------- | ----------- |
-| TV            | `tv`        |
-| Soundbar      | `soundbar`  |
-| Subwoofer     | `subwoofer` |
-| Rear speakers | `rear`      |
+```text
+one device = one Home Assistant entity
+```
 
-Device group meanings:
+Instead, ZYRA uses:
 
-| Spoken phrase                      | Devices controlled                   |
-| ---------------------------------- | ------------------------------------ |
-| TV / Sony TV / television          | TV                                   |
-| Soundbar / sound bar / speaker bar | Soundbar                             |
-| Subwoofer / woofer / sub           | Subwoofer                            |
-| Rear speakers / surround system    | Rear speakers                        |
-| Sound system / audio system        | Soundbar + Subwoofer                 |
-| All speakers / speaker system      | Soundbar + Subwoofer + Rear speakers |
-| Home theater / full system / all   | TV + Soundbar + Subwoofer + Rear     |
+```text
+Physical device
+↓
+Multiple control surfaces
+↓
+Each surface has different capabilities
+```
+
+This allows the same spoken device to use different Home Assistant entities depending on the requested action.
+
+Example:
+
+```text
+Increase TV volume
+→ living_room_tv + volume + volume_up
+→ media_player.tv_remote
+
+Change TV to HDMI 1
+→ living_room_tv + source + select_source
+→ media_player.living_room_tv
+
+Open Netflix on TV
+→ living_room_tv + app + launch_app
+→ remote.living_room_tv
+
+Go to TV home
+→ living_room_tv + app + go_home
+→ remote.living_room_tv
+→ remote.send_command HOME
+
+Close Netflix
+→ living_room_tv + app + go_home
+→ remote.living_room_tv
+→ remote.send_command HOME
+
+Turn on TV
+→ living_room_tv + power + on
+→ switch.sony_tv
+
+Wake TV
+→ living_room_tv + sleep_wake + wake
+→ media_player.living_room_tv
+```
+
+### Registry Devices
+
+| Physical device | Registry ID | Type |
+| --------------- | ----------- | ---- |
+| Sony Bravia 2 MK2 | `living_room_tv` | TV |
+| LG S95TR Soundbar | `lg_s95tr_soundbar` | Soundbar |
+| Subwoofer | `subwoofer` | Relay switch |
+| Rear Speakers | `rear_speakers` | Relay switch |
+
+### Sony Bravia TV Control Surfaces
+
+| Capability | Home Assistant entity |
+| ---------- | --------------------- |
+| Sleep / wake | `media_player.living_room_tv` |
+| Playback | `media_player.living_room_tv` |
+| Source / input select | `media_player.living_room_tv` |
+| Volume | `media_player.tv_remote` |
+| Mute / unmute | `switch.living_room_tv_mute` or supported media surface |
+| Streaming / cast media | `media_player.google_tv_cast` |
+| App launch | `remote.living_room_tv` |
+| Home screen / app exit | `remote.living_room_tv` |
+| Relay mains power | `switch.sony_tv` |
+
+Supported TV sources include:
+
+```text
+TV
+HDMI 1
+HDMI 2
+Audio system
+HDMI 4
+AirPlay
+HDMICEC 1
+HDMICEC 2
+HDMICEC 3
+HDMICEC 4
+HDMICEC 5
+HDMICEC 6
+HDMICEC 7
+HDMICEC 8
+HDMICEC 9
+HDMICEC 10
+HDMICEC 11
+HDMICEC 12
+Satellite
+```
+
+### LG S95TR Soundbar Control Surfaces
+
+| Capability | Home Assistant entity |
+| ---------- | --------------------- |
+| Sleep / wake | `media_player.lg_soundbar` |
+| Playback | `media_player.lg_soundbar` |
+| Volume | `media_player.lg_soundbar` |
+| Mute / unmute | `media_player.lg_soundbar` |
+| Source / input select | `media_player.lg_soundbar` |
+| Sound mode select | `media_player.lg_soundbar` |
+| Cast playback / streaming | `media_player.lg_speaker_cast` |
+| Relay mains power | `switch.soundbar` |
+
+Supported soundbar sources include:
+
+```text
+Bluetooth
+HDMI
+Optical/HDMI ARC
+USB2
+Wi-Fi
+```
+
+Supported soundbar sound modes include:
+
+```text
+AI Sound Pro
+Bass Boost Plus
+Cinema
+Dolby Atmos
+Game
+Music
+Sports
+Standard
+User
+```
+
+### Relay-only Devices
+
+| Device | Registry ID | Home Assistant entity |
+| ------ | ----------- | --------------------- |
+| Subwoofer | `subwoofer` | `switch.subwoofer` |
+| Rear Speakers | `rear_speakers` | `switch.rear_speakers` |
+
+### Device Groups
+
+| Spoken phrase | Registry target | Devices controlled |
+| ------------- | --------------- | ------------------ |
+| Sound system / audio system | `sound_system` | Soundbar + Subwoofer |
+| All speakers / speaker system | `all_speakers` | Soundbar + Subwoofer + Rear Speakers |
+| Home theater / home theatre / full system / everything | `home_theater` | TV + Soundbar + Subwoofer + Rear Speakers |
 
 Important semantic rule:
 
 ```text
 Surround system = rear speakers only
+Sound system = soundbar + subwoofer
 All speakers = soundbar + subwoofer + rear speakers
 Home theater = TV + soundbar + subwoofer + rear speakers
 ```
 
-Supported examples:
+### Power vs Sleep/Wake
+
+ZYRA separates physical relay power from smart-device sleep/wake.
+
+```text
+Turn on TV
+→ relay mains power on
+→ switch.sony_tv
+
+Wake TV
+→ smart TV wake
+→ media_player.living_room_tv
+
+Turn off TV
+→ relay mains power off
+→ switch.sony_tv
+
+Sleep TV
+→ smart TV sleep / standby
+→ media_player.living_room_tv
+```
+
+The same distinction applies to the LG S95TR Soundbar:
+
+```text
+Turn on soundbar
+→ relay mains power on
+→ switch.soundbar
+
+Wake soundbar
+→ smart soundbar wake
+→ media_player.lg_soundbar
+
+Turn off soundbar
+→ relay mains power off
+→ switch.soundbar
+
+Sleep soundbar
+→ smart soundbar sleep / standby
+→ media_player.lg_soundbar
+```
+
+### Status Intelligence
+
+ZYRA can answer detailed status questions through Home Assistant.
+
+Examples:
+
+```text
+What is the status of my TV?
+What input is the TV using?
+What is the soundbar volume?
+What sound mode is the soundbar using?
+What is the status of my home theater?
+Which devices are on?
+```
+
+Example response:
+
+```text
+What is the status of my home theater?
+
+ZYRA response:
+Sony Bravia 2 MK2 is on. input is HDMI1. playing Netflix. LG S95TR Soundbar is on. input is E-ARC. sound mode is Cinema. volume is 25 percent. Subwoofer is on. Rear Speakers is on.
+```
+
+When Home Assistant is unavailable, ZYRA can still read relay-board status for relay-supported devices and adds a backend note explaining that detailed Home Assistant status is unavailable.
+
+### Supported Online Smart-home Examples
 
 ```text
 Turn on the TV
 Turn off the soundbar
-Turn on the sound system
-Turn off all speakers
-Turn on the surround system
-Turn off the TV and turn on everything else
-Shut down everything except the TV
-Which devices are on?
-Is the subwoofer on?
+Wake the TV
+Sleep the soundbar
+Increase TV volume
+Increase TV volume by 5
+Set soundbar volume to 25
+Mute the television
+Put the TV on HDMI 1
+Change the soundbar input to HDMI ARC
+Use cinema sound on the soundbar
+Pause whatever is playing on the TV
+Open Netflix on TV
+Launch Prime Video
+Open Jio Hotstar
+Start YouTube on TV
+Go to home screen
+Exit the app
+Close the app
+Close Netflix
+Close Prime Video
+Turn off the sound system and turn on the TV
+Shut down the home theater except keep the TV on
+What is the status of my home theater?
+```
+
+The router is designed to reject general conversation as smart-home commands.
+
+Examples that remain general conversation:
+
+```text
+What are the best horror movies?
+How are you?
+Explain how Bluetooth works.
+Recommend a good action movie.
 ```
 
 ---
@@ -672,11 +919,18 @@ HA_ENTITY_SOUNDBAR=switch.soundbar
 HA_ENTITY_SUBWOOFER=switch.subwoofer
 HA_ENTITY_REAR=switch.rear_speakers
 
-RELAY_HOME_BASE_URLS=http://192.168.29.97,http://192.168.29.98
-RELAY_HTTP_TIMEOUT=1.5
+RELAY_HOME_BASE_URLS=http://192.168.29.97,http://192.168.29.24
+RELAY_HTTP_TIMEOUT_SEC=2.5
 
 CHROMA_PATH=./data/chroma
 SQLITE_PATH=./data/zyra.db
+```
+The four `HA_ENTITY_*` values are used for relay/mains power status and fallback compatibility.
+
+Detailed smart-device entities such as TV volume, TV source, TV app launch, soundbar source, and soundbar sound mode are configured in:
+
+```text
+zyra-server/device_registry.json
 ```
 
 Do not commit `.env`.
@@ -702,10 +956,28 @@ Kokoro TTS
 Memory
 ```
 
+Test the capability-aware device registry:
+
+```powershell
+python test_device_registry.py
+```
+
+Test the semantic registry router:
+
+```powershell
+python test_registry_intent_router.py
+```
+
 Test Home Assistant and relay fallback:
 
 ```powershell
 python test_home_assistant.py
+```
+
+Optional live registry control test:
+
+```powershell
+python test_registry_live.py
 ```
 
 Test Kokoro TTS WAV generation:
@@ -756,7 +1028,7 @@ Expected server output:
 ZYRA server starting
 Whisper ready
 Kokoro TTS ready
-Intent router ready
+Registry intent router ready
 Memory engine ready
 Smart home engine ready
 ```
@@ -858,7 +1130,7 @@ Do not commit `zyra_config.h`.
 #define HA_ENTITY_REAR "switch.rear_speakers"
 
 // ── ESP8266 relay board on home Wi-Fi ─────────────
-#define RELAY_HOME_BASE_URL "http://192.168.29.97"
+#define RELAY_HOME_BASE_URL "http://192.168.29.24"
 
 // ── Emergency relay AP fallback ───────────────────
 #define RELAY_AP_SSID "ESP-REMOTE-DIRECT"

@@ -170,42 +170,67 @@ static void ws_event_handler(void* arg,
 
                     // Detect online command failure from server metadata/text.
                     bool detected_failure = false;
+                    bool has_explicit_command_result = false;
+                    bool explicit_success = false;
 
                     if (command_success && cJSON_IsBool(command_success)) {
-                        detected_failure = !cJSON_IsTrue(command_success);
+                        has_explicit_command_result = true;
+
+                        if (cJSON_IsTrue(command_success)) {
+                            detected_failure = false;
+                            explicit_success = true;
+                        } else {
+                            detected_failure = true;
+                        }
                     }
 
                     if (command_result && cJSON_IsString(command_result)) {
-                        if (strcmp(command_result->valuestring, "failed") == 0 ||
+                        has_explicit_command_result = true;
+
+                        if (strcmp(command_result->valuestring, "ok") == 0 ||
+                            strcmp(command_result->valuestring, "success") == 0) {
+                            detected_failure = false;
+                            explicit_success = true;
+                        } else if (
+                            strcmp(command_result->valuestring, "failed") == 0 ||
                             strcmp(command_result->valuestring, "failure") == 0 ||
-                            strcmp(command_result->valuestring, "error") == 0) {
+                            strcmp(command_result->valuestring, "error") == 0
+                        ) {
                             detected_failure = true;
                         }
                     }
 
                     bool detected_success_fallback = false;
 
-                    if (response_text && cJSON_IsString(response_text)) {
-                        if (text_looks_like_success_fallback(response_text->valuestring)) {
-                            detected_success_fallback = true;
+                    // Only use text heuristics when the server did not explicitly tell us
+                    // whether the command succeeded.
+                    if (!has_explicit_command_result) {
+                        if (response_text && cJSON_IsString(response_text)) {
+                            if (text_looks_like_success_fallback(response_text->valuestring)) {
+                                detected_success_fallback = true;
+                            }
+
+                            if (text_looks_like_command_failure(response_text->valuestring)) {
+                                detected_failure = true;
+                            }
                         }
 
-                        if (text_looks_like_command_failure(response_text->valuestring)) {
-                            detected_failure = true;
+                        if (audio_text && cJSON_IsString(audio_text)) {
+                            if (text_looks_like_success_fallback(audio_text->valuestring)) {
+                                detected_success_fallback = true;
+                            }
+
+                            if (text_looks_like_command_failure(audio_text->valuestring)) {
+                                detected_failure = true;
+                            }
+                        }
+
+                        if (detected_success_fallback) {
+                            detected_failure = false;
                         }
                     }
 
-                    if (audio_text && cJSON_IsString(audio_text)) {
-                        if (text_looks_like_success_fallback(audio_text->valuestring)) {
-                            detected_success_fallback = true;
-                        }
-
-                        if (text_looks_like_command_failure(audio_text->valuestring)) {
-                            detected_failure = true;
-                        }
-                    }
-
-                    if (detected_success_fallback) {
+                    if (explicit_success) {
                         detected_failure = false;
                     }
 

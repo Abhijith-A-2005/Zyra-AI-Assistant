@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "rooms": {
+    "living_room": {
+      "name": "Living Room",
+      "aliases": ["living room", "hall"]
+    }
+  },
+  "devices": {
+    "living_room_tv": {
+      "name": "Sony Bravia 2 MK2",
+      "type": "tv",
+      "room": "living_room",
+      "primary_entity": "media_player.living_room_tv",
+      "legacy_device_id": "tv",
+      "aliases": [
+        "tv",
+        "sony tv",
+        "bravia",
+        "living room tv",
+        "television"
+      ],
+      "surfaces": {
+        "native_tv": {
+          "entity_id": "media_player.living_room_tv",
+          "domain": "media_player",
+          "capabilities": [
+            "sleep_wake",
+            "playback",
+            "source"
+          ],
+          "sources": [
+            "TV",
+            "HDMI 1",
+            "HDMI 2",
+            "Audio system",
+            "HDMI 4",
+            "AirPlay",
+            "HDMICEC 1",
+            "HDMICEC 2",
+            "HDMICEC 3",
+            "HDMICEC 4",
+            "HDMICEC 5",
+            "HDMICEC 6",
+            "HDMICEC 7",
+            "HDMICEC 8",
+            "HDMICEC 9",
+            "HDMICEC 10",
+            "HDMICEC 11",
+            "HDMICEC 12",
+            "Satellite"
+          ]
+        },
+        "tv_remote": {
+          "entity_id": "media_player.tv_remote",
+          "domain": "media_player",
+          "capabilities": [
+            "playback",
+            "volume",
+            "mute",
+            "next_previous",
+            "stream"
+          ]
+        },
+        "google_tv_cast": {
+          "entity_id": "media_player.google_tv_cast",
+          "domain": "media_player",
+          "capabilities": [
+            "playback",
+            "volume",
+            "mute",
+            "stream"
+          ]
+        },
+        "tv_app_launcher": {
+          "entity_id": "remote.living_room_tv",
+          "domain": "remote",
+          "capabilities": [
+            "app"
+          ]
+        },
+        "mute_switch": {
+          "entity_id": "switch.living_room_tv_mute",
+          "domain": "switch",
+          "capabilities": [
+            "mute_switch"
+          ]
+        },
+        "relay_power": {
+          "entity_id": "switch.sony_tv",
+          "domain": "switch",
+          "capabilities": [
+            "power",
+            "relay_power"
+          ]
+        }
+      }
+    },
+
+    "lg_s95tr_soundbar": {
+      "name": "LG S95TR Soundbar",
+      "type": "soundbar",
+      "room": "living_room",
+      "primary_entity": "media_player.lg_soundbar",
+      "legacy_device_id": "soundbar",
+      "aliases": [
+        "soundbar",
+        "lg soundbar",
+        "speaker bar",
+        "audio system",
+        "sound system"
+      ],
+      "surfaces": {
+        "native_soundbar": {
+          "entity_id": "media_player.lg_soundbar",
+          "domain": "media_player",
+          "capabilities": [
+            "sleep_wake",
+            "playback",
+            "volume",
+            "mute",
+            "source",
+            "sound_mode"
+          ],
+          "sources": [
+            "Bluetooth",
+            "HDMI",
+            "Optical/HDMI ARC",
+            "USB2",
+            "Wi-Fi"
+          ],
+          "sound_modes": [
+            "AI Sound Pro",
+            "Bass Boost Plus",
+            "Cinema",
+            "Dolby Atmos",
+            "Game",
+            "Music",
+            "Sports",
+            "Standard",
+            "User"
+          ]
+        },
+        "google_soundbar_cast": {
+          "entity_id": "media_player.lg_speaker_cast",
+          "domain": "media_player",
+          "capabilities": [
+            "playback",
+            "volume",
+            "mute",
+            "stream"
+          ]
+        },
+        "relay_power": {
+          "entity_id": "switch.soundbar",
+          "domain": "switch",
+          "capabilities": [
+            "power",
+            "relay_power"
+          ]
+        }
+      }
+    },
+
+    "subwoofer": {
+      "name": "Subwoofer",
+      "type": "relay_switch",
+      "room": "living_room",
+      "primary_entity": "switch.subwoofer",
+      "legacy_device_id": "subwoofer",
+      "aliases": [
+        "subwoofer",
+        "woofer",
+        "sub"
+      ],
+      "surfaces": {
+        "relay_power": {
+          "entity_id": "switch.subwoofer",
+          "domain": "switch",
+          "capabilities": [
+            "power",
+            "relay_power"
+          ]
+        }
+      }
+    },
+
+    "rear_speakers": {
+      "name": "Rear Speakers",
+      "type": "relay_switch",
+      "room": "living_room",
+      "primary_entity": "switch.rear_speakers",
+      "legacy_device_id": "rear",
+      "aliases": [
+        "rear speakers",
+        "rear",
+        "surround",
+        "surround system",
+        "surround speakers",
+        "back speakers"
+      ],
+      "surfaces": {
+        "relay_power": {
+          "entity_id": "switch.rear_speakers",
+          "domain": "switch",
+          "capabilities": [
+            "power",
+            "relay_power"
+          ]
+        }
+      }
+    }
+  },
+
+  "groups": {
+    "sound_system": {
+      "name": "Sound System",
+      "aliases": [
+        "sound system",
+        "audio system"
+      ],
+      "members": [
+        "lg_s95tr_soundbar",
+        "subwoofer"
+      ]
+    },
+    "all_speakers": {
+      "name": "All Speakers",
+      "aliases": [
+        "all speakers",
+        "speaker system"
+      ],
+      "members": [
+        "lg_s95tr_soundbar",
+        "subwoofer",
+        "rear_speakers"
+      ]
+    },
+    "home_theater": {
+      "name": "Home Theater",
+      "aliases": [
+        "home theater",
+        "home theatre",
+        "full system",
+        "everything",
+        "all devices"
+      ],
+      "members": [
+        "living_room_tv",
+        "lg_s95tr_soundbar",
+        "subwoofer",
+        "rear_speakers"
+      ]
+    }
+  }
+}

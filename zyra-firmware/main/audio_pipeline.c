@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -11,6 +12,7 @@ static const char* TAG = "AUDIO";
 
 static i2s_chan_handle_t tx_handle = NULL;
 static i2s_chan_handle_t rx_handle = NULL;
+static SemaphoreHandle_t tx_mutex = NULL;
 
 #define I2S_MIC_SCK         1
 #define I2S_MIC_WS          2
@@ -155,6 +157,15 @@ esp_err_t audio_pipeline_init(void) {
         return err;
     }
 
+    if (!tx_mutex) {
+        tx_mutex = xSemaphoreCreateMutex();
+
+        if (!tx_mutex) {
+            ESP_LOGE(TAG, "Failed to create TX audio mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     ESP_LOGI(TAG, "Amp initialized on I2S port 0");
     return ESP_OK;
 }
@@ -248,6 +259,33 @@ esp_err_t audio_play_response(const uint8_t* data,
         return ESP_FAIL;
     }
 
+    // I2S speaker output is 16-bit PCM.
+    //
+    // Why:
+    // If an odd number of bytes is written to I2S, the next block can start
+    // half a sample late. That creates harsh digital noise.
+    if (len & 1) {
+        ESP_LOGW(TAG, "Odd PCM length received by I2S: %zu, trimming 1 byte", len);
+        len--;
+    }
+
+    if (len == 0) {
+        return ESP_OK;
+    }
+
+    if (sample_rate < 8000 || sample_rate > 48000) {
+        ESP_LOGE(TAG, "Invalid playback sample rate: %d", sample_rate);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t result = ESP_OK;
+    bool locked = false;
+
+    if (tx_mutex) {
+        xSemaphoreTake(tx_mutex, portMAX_DELAY);
+        locked = true;
+    }
+
     static int s_current_tx_sample_rate = 0;
 
     if (s_current_tx_sample_rate != sample_rate) {
@@ -256,6 +294,7 @@ esp_err_t audio_play_response(const uint8_t* data,
         err = i2s_channel_disable(tx_handle);
 
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+
             ESP_LOGW(TAG, "I2S TX disable before reconfig returned: %s",
                      esp_err_to_name(err));
         }
@@ -271,7 +310,9 @@ esp_err_t audio_play_response(const uint8_t* data,
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "I2S TX clock reconfig failed: %s",
                      esp_err_to_name(err));
-            return err;
+
+            result = err;
+            goto cleanup;
         }
 
         err = i2s_channel_enable(tx_handle);
@@ -279,7 +320,9 @@ esp_err_t audio_play_response(const uint8_t* data,
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGE(TAG, "I2S TX enable failed: %s",
                      esp_err_to_name(err));
-            return err;
+
+            result = err;
+            goto cleanup;
         }
 
         s_current_tx_sample_rate = sample_rate;
@@ -288,15 +331,26 @@ esp_err_t audio_play_response(const uint8_t* data,
     }
 
     size_t offset = 0;
-    size_t written = 0;
-
-    const size_t write_chunk = 4096;
+    const size_t chunk = 1024;
 
     while (offset < len) {
-        size_t to_write = len - offset;
+        size_t written = 0;
 
-        if (to_write > write_chunk) {
-            to_write = write_chunk;
+        size_t to_write = (len - offset) < chunk
+            ? (len - offset)
+            : chunk;
+
+        // Keep every write even-sized.
+        //
+        // Why:
+        // 16-bit mono PCM = 2 bytes per sample.
+        // Writing odd byte counts can corrupt sample alignment.
+        if (to_write & 1) {
+            to_write--;
+        }
+
+        if (to_write == 0) {
+            break;
         }
 
         esp_err_t err = i2s_channel_write(
@@ -308,20 +362,31 @@ esp_err_t audio_play_response(const uint8_t* data,
         );
 
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
-            return err;
+            ESP_LOGE(TAG, "I2S write failed: %s",
+                     esp_err_to_name(err));
+
+            result = err;
+            goto cleanup;
         }
 
         if (written == 0) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
+            ESP_LOGE(TAG, "I2S write returned 0 bytes");
+
+            result = ESP_FAIL;
+            goto cleanup;
         }
 
         offset += written;
     }
 
     ESP_LOGD(TAG, "Played %zu bytes at %dHz", len, sample_rate);
-    return ESP_OK;
+
+cleanup:
+    if (locked) {
+        xSemaphoreGive(tx_mutex);
+    }
+
+    return result;
 }
 
 void audio_tone_test(void) {

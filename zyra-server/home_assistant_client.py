@@ -239,6 +239,126 @@ class HomeAssistantClient:
                 states[device] = None
 
         return states
+    
+    def call_service(
+        self,
+        domain: str,
+        service: str,
+        data: dict,
+    ) -> bool:
+        """
+        Call any Home Assistant service.
+
+        Media devices require services like:
+          media_player.volume_set
+          media_player.select_source
+          media_player.media_play
+          media_player.play_media
+        """
+        if not self.configured:
+            logger.warning("Home Assistant is not configured")
+            return False
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/api/services/{domain}/{service}",
+                headers=self._headers(),
+                json=data,
+                timeout=self.timeout,
+            )
+
+            if response.status_code >= 400:
+                logger.error(
+                    "Home Assistant service failed HTTP %s for %s.%s: %s",
+                    response.status_code,
+                    domain,
+                    service,
+                    response.text,
+                )
+                return False
+
+            logger.info(
+                "Home Assistant service OK: %s.%s data=%s",
+                domain,
+                service,
+                data,
+            )
+            return True
+
+        except requests.RequestException as e:
+            logger.warning(
+                "Home Assistant service failed for %s.%s: %s",
+                domain,
+                service,
+                e,
+            )
+            return False
+
+    def get_entity_raw_state(self, entity_id: str) -> Optional[str]:
+        """
+        Read raw HA state using entity_id directly.
+
+        Why:
+        Registry devices are no longer limited to old logical IDs like tv/soundbar.
+        """
+        if not self.configured:
+            return HA_STATE_REQUEST_FAILED
+
+        try:
+            response = self.session.get(
+                f"{self.base_url}/api/states/{entity_id}",
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+
+            if response.status_code == 404:
+                logger.error("Home Assistant entity not found: %s", entity_id)
+                return HA_STATE_NOT_FOUND
+
+            response.raise_for_status()
+            return response.json().get("state")
+
+        except requests.RequestException as e:
+            logger.warning(
+                "Home Assistant raw state failed for entity %s: %s",
+                entity_id,
+                e,
+            )
+            return HA_STATE_REQUEST_FAILED
+        
+    def get_entity_state_object(self, entity_id: str) -> Optional[dict]:
+        """
+        Return the full Home Assistant state object for an entity.
+
+        Why:
+        Home Assistant can accept a service call even if the actual device does
+        not visibly change. Registry commands need to verify real attributes
+        like volume_level, source, sound_mode, and mute state.
+        """
+        if not self.configured:
+            return None
+
+        try:
+            response = self.session.get(
+                f"{self.base_url}/api/states/{entity_id}",
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+
+            if response.status_code == 404:
+                logger.error("Home Assistant entity not found: %s", entity_id)
+                return None
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException as e:
+            logger.warning(
+                "Home Assistant full entity state failed for %s: %s",
+                entity_id,
+                e,
+            )
+            return None
 
     def set_device(self, device: str, action: str) -> bool:
         entity_id = self.entities.get(device)

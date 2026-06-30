@@ -120,6 +120,17 @@ async def _receive_response(ws):
                     print(f"[STT ] Transcript: '{transcript}'")
                     print("[LLM ] Thinking...")
 
+                elif stage == "command":
+                    response = data.get("response", "")
+                    ok = data.get("command_success", None)
+
+                    if ok is True:
+                        print(f"[CMD ] Success: '{response}'")
+                    elif ok is False:
+                        print(f"[CMD ] Failed: '{response}'")
+                    else:
+                        print(f"[CMD ] Response: '{response}'")
+
                 elif stage == "speaking":
                     response = data.get("response", "")
                     print(f"[LLM ] Response: '{response}'")
@@ -130,6 +141,14 @@ async def _receive_response(ws):
                     sample_rate    = data.get("sample_rate", 22050)
                     print(f"[TTS ] Receiving {audio_expected} bytes"
                           f" at {sample_rate}Hz...")
+
+                elif status == "audio_stream_end":
+                    print("[TTS ] Stream ended.")
+                    break
+
+                elif status == "ready":
+                    print(f"[READY] {data.get('message', 'Ready')}")
+                    break
 
                 elif status == "error":
                     print(f"[ERR ] {data.get('message', 'Unknown error')}")
@@ -150,8 +169,8 @@ async def _receive_response(ws):
                     _play_audio(audio_data, sample_rate)
                     break
 
-    except websockets.exceptions.ConnectionClosed:
-        print("[TEST] Connection closed by server")
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"[TEST] Connection closed: code={e.code} reason={e.reason}")
 
 
 def _play_audio(audio_bytes: bytes, sample_rate: int):

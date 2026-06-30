@@ -12,7 +12,7 @@ from llm import LLMEngine
 from tts import TTSEngine
 from memory import MemoryEngine
 from smart_home import SmartHomeEngine
-from intent_router import IntentRouter
+from registry_intent_router import RegistryIntentRouter
 from concurrent.futures import ThreadPoolExecutor
 
 import sys
@@ -46,7 +46,7 @@ TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 memory = MemoryEngine()
 smart_home = SmartHomeEngine()
-intent_router = IntentRouter()
+registry_intent_router = RegistryIntentRouter()
 logger.info("All engines ready")
 
 # ── FastAPI app ───────────────────────────────────
@@ -1011,61 +1011,229 @@ async def send_direct_voice_response(
         command_success=command_success,
     )
 
+def join_spoken_targets(targets: list[str]) -> str:
+    clean = [target.strip() for target in targets if target and target.strip()]
+
+    if not clean:
+        return ""
+
+    if len(clean) == 1:
+        return clean[0]
+
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+
+    return ", ".join(clean[:-1]) + f", and {clean[-1]}"
+
+
+def build_combined_smart_home_response(results) -> str:
+    """
+    Build natural smart-home speech.
+
+    """
+
+    grouped: dict[str, list[str]] = {}
+    ordered_actions: list[str] = []
+    backend_notes: list[str] = []
+    raw_response_parts: list[str] = []
+
+    for result in results:
+        if not getattr(result, "success", False):
+            continue
+
+        note = (getattr(result, "backend_note", "") or "").strip()
+
+        if note and note not in backend_notes:
+            backend_notes.append(note)
+
+        spoken_action = (getattr(result, "spoken_action", "") or "").strip()
+        spoken_target = (getattr(result, "spoken_target", "") or "").strip()
+
+        if not spoken_action or not spoken_target:
+            fallback_text = (getattr(result, "response", "") or "").strip()
+
+            if fallback_text and fallback_text not in raw_response_parts:
+                raw_response_parts.append(fallback_text)
+
+            continue
+
+        if spoken_action not in grouped:
+            grouped[spoken_action] = []
+            ordered_actions.append(spoken_action)
+
+        if spoken_target not in grouped[spoken_action]:
+            grouped[spoken_action].append(spoken_target)
+
+    action_phrases: list[str] = []
+
+    for action in ordered_actions:
+        targets = grouped.get(action, [])
+
+        if targets:
+            action_phrases.append(f"{action} {join_spoken_targets(targets)}")
+        else:
+            action_phrases.append(action)
+
+    final_parts: list[str] = []
+
+    if action_phrases:
+        final_parts.append(f"Done, I {join_spoken_targets(action_phrases)}.")
+
+    final_parts.extend(raw_response_parts)
+
+    if not final_parts:
+        final_parts.append("Done.")
+
+    response = " ".join(
+        part.strip()
+        for part in final_parts
+        if part and part.strip()
+    )
+
+    if backend_notes:
+        response += " " + " ".join(
+            note.rstrip(".") + "."
+            for note in backend_notes
+        )
+
+    return response
+
 async def try_smart_home_command(websocket: WebSocket,
                                  transcript: str) -> bool:
     """
     Returns True if the transcript was handled as a smart-home request.
-    Returns False if it should continue to normal LLM conversation.
+    Returns False only when the semantic router classifies it as general chat.
+
+    Important:
+    This path intentionally uses only RegistryIntentRouter now.
+    The older IntentRouter fallback was removed because it depended on
+    hardcoded word lists and regex phrase matching.
     """
-    route_start = time.perf_counter()
 
-    routed = intent_router.route(transcript)
-
-    route_ms = (time.perf_counter() - route_start) * 1000
+    registry_start = time.perf_counter()
+    registry_command = registry_intent_router.route(transcript)
+    registry_ms = (time.perf_counter() - registry_start) * 1000
 
     command_summary = [
         {
-            "action": cmd.action,
-            "devices": cmd.devices,
+            "target": command.spoken_target,
+            "capability": command.capability,
+            "action": command.action,
+            "value": command.value,
         }
-        for cmd in routed.commands
+        for command in getattr(registry_command, "commands", [])
     ]
 
     logger.info(
-        f"Intent routing took {route_ms:.0f}ms | "
-        f"domain={routed.domain} intent={routed.intent} "
-        f"action={routed.action} devices={routed.devices} "
+        f"Registry semantic routing took {registry_ms:.0f}ms | "
+        f"handled={registry_command.handled} "
         f"commands={command_summary} "
-        f"confidence={routed.confidence:.2f}"
+        f"error_response={getattr(registry_command, 'error_response', '')!r} "
+        f"reason={registry_command.reason}"
     )
 
-    if routed.domain != "smart_home":
+    # General conversation: continue to normal LLM pipeline.
+    if not registry_command.handled:
         return False
 
-    result = smart_home.handle_intent(routed)
+    # Smart-home request, but not safe/valid to execute.
+    error_response = getattr(registry_command, "error_response", "")
 
-    if not result.handled:
+    if error_response:
+        await websocket.send_json({
+            "status":          "processing",
+            "stage":           "command",
+            "transcript":      transcript,
+            "response":        error_response,
+            "command_success": False,
+            "command_result":  "failed",
+        })
+
+        await send_direct_voice_response(
+            websocket,
+            error_response,
+            command_success=False,
+        )
+
+        return True
+
+    commands = list(getattr(registry_command, "commands", []) or [])
+
+    if not commands:
+        # Defensive fallback for compatibility with old RegistryVoiceCommand.
+        if registry_command.spoken_target and registry_command.action:
+            commands = [registry_command]
+        else:
+            await send_direct_voice_response(
+                websocket,
+                "I understood that as a smart-home request, but I could not build a safe command.",
+                command_success=False,
+            )
+            return True
+
+    results = []
+
+    for command in commands:
+        result = smart_home.execute_registry_command(
+            spoken_target=command.spoken_target,
+            capability=command.capability,
+            action=command.action,
+            value=command.value,
+        )
+
+        if not result.handled:
+            results.append(result)
+            continue
+
+        logger.info(
+            f"Direct registry smart-home result | "
+            f"target={command.spoken_target} capability={command.capability} "
+            f"action={command.action} value={command.value} "
+            f"success={result.success} response='{result.response}'"
+        )
+
+        results.append(result)
+
+    handled_results = [result for result in results if result.handled]
+
+    if not handled_results:
         return False
 
-    logger.info(
-        f"Direct smart-home result | action={result.action} "
-        f"devices={result.devices} response='{result.response}'"
-    )
+    success = all(result.success for result in handled_results)
+
+    if registry_command.error_response:
+        response_text = registry_command.error_response
+
+    elif success:
+        response_text = build_combined_smart_home_response(handled_results)
+
+    else:
+        failed = [
+            result.response
+            for result in handled_results
+            if not result.success and result.response
+        ]
+
+        if failed:
+            response_text = failed[0]
+        else:
+            response_text = "I could not complete the smart-home request."
 
     await websocket.send_json({
-    "status":          "processing",
-    "stage":           "command",
-    "transcript":      transcript,
-    "response":        result.response,
-    "command_success": result.success,
-    "command_result":  "ok" if result.success else "failed",
-    })      
+        "status":          "processing",
+        "stage":           "command",
+        "transcript":      transcript,
+        "response":        response_text,
+        "command_success": success,
+        "command_result":  "ok" if success else "failed",
+    })
 
     await send_direct_voice_response(
         websocket,
-        result.response,
-        command_success=result.success,
+        response_text,
+        command_success=success,
     )
+
     return True
 
 async def run_pipeline(websocket: WebSocket,

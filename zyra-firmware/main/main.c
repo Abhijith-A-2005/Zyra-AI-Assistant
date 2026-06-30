@@ -1457,7 +1457,7 @@ static void zyra_task(void* param) {
 
     // ── VAD settings ──────────────────────────────
     // Frame = 256 samples @ 16kHz = 16ms per frame
-    #define VAD_SPEECH_THRESHOLD       1400  // must exceed to count as speech
+    #define VAD_SPEECH_THRESHOLD       400  // must exceed to count as speech
     #define VAD_SILENCE_THRESHOLD      1200  // below this = silence
     #define VAD_TRIGGER_FRAMES            5  // ~160ms continuous speech to trigger
     #define VAD_SPEECH_FRAMES_MIN        12  // ~400ms real speech required
